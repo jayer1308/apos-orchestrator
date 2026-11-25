@@ -1,6 +1,6 @@
 # GOAL-004 v2: Hỗ trợ Multi-WP: loop theo dõi trạng thái theo từng package, integration gate khi mọi package green, runner drive xử lý handover theo từng package — chứng minh bằng live-test lái Goal thật có 2 package song song chỉ bằng runner.
 
-Status: verified
+Status: closed
 
 ```json
 {
