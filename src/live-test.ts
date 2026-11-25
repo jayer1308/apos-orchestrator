@@ -1,14 +1,28 @@
-// Live test for GOAL-002 AC-4 (CHK-4): builds its own sample APOS
+// Live test for GOAL-003 AC-4 (CHK-4): builds its own sample APOS
 // project in a temp dir and drives a real Goal from `selected` to green
-// through the real loop (`readGoalState` + `nextStep` + the handover
-// record in `loop.ts`), asserting the step sequence including
-// worker-write-code -> package-submit.
+// ONLY through the subprocess drive runner (`node dist/index.js --repo
+// … --goal … --drive [--handover <sha>]`) — never by calling the loop /
+// state-machine / state-reader helpers directly, and never by a
+// hand-kept handover script. The driver reads the runner's printed step
+// and executes it (pty approve/select for the fixture Goal, lead
+// propose/commit and package submit through the APOS CLI, worker
+// write/fix by committing code), then asks the runner again.
+//
+// Two scenarios run back to back:
+//   (a) `green-first`: Worker commit đúng → drive --handover →
+//       package-submit → verified ngay lần nộp đầu.
+//   (b) `red-then-green`: Worker commit sai cố ý (greet trả "hello") →
+//       gate đỏ → Worker fix commit mới → drive --handover <sha mới> →
+//       package-submit → verified.
 //
 // Self-contained on purpose: each gate check runs in a fresh worktree
 // (APOS #70), so this entry must not depend on any repo outside the temp
 // dir it builds — only the APOS CLI (resolved like the state reader
-// does) and git. The sample project needs no dependencies: its only
-// check is `npm test`, which runs plain `node test.mjs`.
+// does) and git — and it builds the drive runner itself (`npm run
+// build` in the orchestrator repo, under a lock dir so parallel test
+// files do not build over each other) when `dist/index.js` is missing
+// or older than the sources. The sample project needs no dependencies:
+// its only check is `npm test`, which runs plain `node test.mjs`.
 //
 // Provisioning note (fixture use only, logged on every run): getting the
 // sample Goal to `selected` needs the human-gated `goal approve` /
@@ -29,24 +43,35 @@
 // (`node dist/live-test.js`).
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveAposCli } from "./apos-cli.js";
-import {
-  applyHandover,
-  consumeHandover,
-  createRunState,
-  markRed,
-  recordHandover,
-  verifyHandover,
-} from "./loop.js";
-import { nextStep } from "./state-machine.js";
-import { readGoalState } from "./state-reader.js";
 
 export const LIVE_GOAL_ID = "GOAL-001";
 export const LIVE_PACKAGE_ID = "WP-MAIN";
+
+/** The orchestrator repo root (this module lives in src/ or dist/). */
+const ORCHESTRATOR_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+/** The built drive runner this test spawns (see ensureRunnerBuilt). */
+const RUNNER = join(ORCHESTRATOR_ROOT, "dist/index.js");
+
+export interface LiveScenarioResult {
+  name: string;
+  steps: string[];
+  verified: boolean;
+  projectDir: string;
+}
 
 export interface LiveTestResult {
   goalId: string;
@@ -54,6 +79,7 @@ export interface LiveTestResult {
   steps: string[];
   verified: boolean;
   log: string;
+  scenarios: LiveScenarioResult[];
 }
 
 const SAMPLE_PACKAGE_JSON = `{
@@ -75,6 +101,12 @@ const SAMPLE_GREET_BASE = `export function greet() {
 const SAMPLE_GREET_FIXED = `export function greet() {
   return "xin chào";
 }
+`;
+
+const SAMPLE_GREET_WRONG = `export function greet() {
+  return "hello";
+}
+// worker: first attempt
 `;
 
 const SAMPLE_TEST = `import assert from "node:assert";
@@ -272,34 +304,179 @@ function runAposPty(
   });
 }
 
-/**
- * Build the sample APOS project in `baseDir` and drive one real Goal
- * from `selected` to green through the real loop, returning the step
- * sequence and the evidence log. Throws when the Goal does not verify
- * or a step the driver cannot execute appears.
- */
-export async function runLiveTest(options?: {
-  baseDir?: string;
-}): Promise<LiveTestResult> {
-  const cli = resolveAposCli();
-  const baseDir =
-    options?.baseDir ?? mkdtempSync(join(tmpdir(), "apos-orchestrator-live-"));
-  const projectDir = join(baseDir, "sample");
-  mkdirSync(projectDir, { recursive: true });
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 
-  const logLines: string[] = [];
-  const steps: string[] = [];
-  const log = (line: string): void => {
-    logLines.push(line);
-    console.log(line);
+/** True when the built runner exists and is newer than every src/*.ts file. */
+function distIsFresh(): boolean {
+  if (!existsSync(RUNNER)) {
+    return false;
+  }
+  const distMtime = statSync(RUNNER).mtimeMs;
+  const srcDir = join(ORCHESTRATOR_ROOT, "src");
+  for (const file of readdirSync(srcDir)) {
+    if (file.endsWith(".ts") && statSync(join(srcDir, file)).mtimeMs > distMtime) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Make sure the drive runner the test spawns (`dist/index.js`) exists
+ * and is built from the current sources. A fresh gate worktree (APOS
+ * #70) has no `dist/` (gitignored), and `npm test` does not build, so
+ * the test builds it itself here. Parallel test files serialize on a
+ * lock dir so two builds never write `dist/` over each other.
+ */
+async function ensureRunnerBuilt(log: (line: string) => void): Promise<void> {
+  if (distIsFresh()) {
+    return;
+  }
+  const lockDir = join(ORCHESTRATOR_ROOT, "dist", ".live-test-build.lock");
+  const deadline = Date.now() + 120_000;
+  mkdirSync(join(ORCHESTRATOR_ROOT, "dist"), { recursive: true });
+  for (;;) {
+    if (distIsFresh()) {
+      return;
+    }
+    try {
+      // Atomic acquire: plain mkdir throws EEXIST when another builder
+      // already holds the lock.
+      mkdirSync(lockDir);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== "EEXIST") {
+        throw error;
+      }
+      // A lock left behind by a crashed build (older than 2 minutes)
+      // is stale: remove it and retry instead of waiting it out.
+      try {
+        if (Date.now() - statSync(lockDir).mtimeMs > 120_000) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // The lock vanished between the calls; retry acquiring it.
+        continue;
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        "live test: timed out waiting for another test file to build the drive runner",
+      );
+    }
+    await sleep(500);
+  }
+  try {
+    log("live test: building the drive runner (npm run build) — dist/ is missing or stale");
+    await runOrThrow("npm run build", "npm", ["run", "build"], ORCHESTRATOR_ROOT);
+    log("live test: drive runner built");
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+  if (!existsSync(RUNNER)) {
+    throw new Error("live test: npm run build did not produce dist/index.js");
+  }
+}
+
+interface DriveStep {
+  action: string;
+  handoverCommit?: string | undefined;
+  status?: string | undefined;
+}
+
+/**
+ * One drive-runner invocation: `node dist/index.js --repo <projectDir>
+ * --goal <id> --drive [--handover <sha>]`. The runner only prints the
+ * next step; this test executes it. Returns the printed step action,
+ * the handover commit it carries (if any) and the printed Goal status.
+ */
+async function drive(
+  projectDir: string,
+  scenario: string,
+  handover: string | undefined,
+  log: (line: string) => void,
+): Promise<DriveStep> {
+  const args = ["--repo", projectDir, "--goal", LIVE_GOAL_ID, "--drive"];
+  if (handover !== undefined) {
+    args.push("--handover", handover);
+  }
+  log(`live: drive ${scenario}: node dist/index.js ${args.join(" ")}`);
+  const out = await runCommand("node", [RUNNER, ...args], projectDir);
+  log(`live: drive ${scenario} output:\n${(out.stdout + out.stderr).trim()}`);
+  if (out.exitCode !== 0) {
+    throw new Error(
+      `live: drive runner failed for ${scenario} (exit ${out.exitCode}): ` +
+        `${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
+    );
+  }
+  const stepMatch = /next step: ([a-z-]+)/.exec(out.stdout);
+  if (stepMatch === null || stepMatch[1] === undefined) {
+    throw new Error(
+      `live: drive runner printed no next step for ${scenario}: ${out.stdout.slice(0, 1000)}`,
+    );
+  }
+  const handoverMatch = /handover commit: ([0-9a-f]+)/.exec(out.stdout);
+  const statusMatch = /\(status: ([a-z-]+)\)/.exec(out.stdout);
+  return {
+    action: stepMatch[1],
+    handoverCommit: handoverMatch?.[1],
+    status: statusMatch?.[1],
   };
-  log(
-    "live test: provisioning dùng một lần — Goal mẫu do chính test tạo " +
-      "trong thư mục tạm; approve/select được xác nhận tương tác qua pty " +
-      "(gõ lại ID trên TTY), không dùng --on-behalf, không sửa tay state " +
-      ".apos/controller.",
+}
+
+/**
+ * Run `package submit` with a verified handover commit. Returns the
+ * gate result ("green" | "red"). The runner reconciles the submitted
+ * commit from the reader state on the next drive call, so the driver
+ * keeps no handover record of its own.
+ */
+async function submitPackage(
+  cli: string,
+  projectDir: string,
+  commit: string,
+  log: (line: string) => void,
+): Promise<string> {
+  const out = await runCommand(
+    "node",
+    [cli, "--repo", projectDir, "package", "submit", LIVE_GOAL_ID, LIVE_PACKAGE_ID, "--commit", commit, "--json"],
+    projectDir,
   );
-  log(`live test: projectDir=${projectDir}`);
+  const parsed = JSON.parse(out.stdout) as { result?: unknown; goalStatus?: unknown };
+  const result = String(parsed.result ?? "?");
+  log(`live: package-submit ${commit} -> ${result} (exit ${out.exitCode})`);
+  if (out.exitCode === 0 && result === "green") {
+    return "green";
+  }
+  if (result === "red") {
+    log(`live: gate red for ${commit}; the driver asks the runner again for the fix step`);
+    return "red";
+  }
+  throw new Error(
+    `live: package submit did not go green or red (exit ${out.exitCode}): ` +
+      `${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
+  );
+}
+
+/**
+ * Build one sample APOS project and drive its real Goal from `selected`
+ * to green ONLY through the drive runner. `wrongFirst` makes the first
+ * Worker commit intentionally wrong (greet returns "hello"), so the
+ * gate goes red once and the Worker must fix it.
+ */
+async function runScenario(
+  name: string,
+  wrongFirst: boolean,
+  baseDir: string,
+  cli: string,
+  log: (line: string) => void,
+): Promise<LiveScenarioResult> {
+  const projectDir = join(baseDir, name, "sample");
+  mkdirSync(projectDir, { recursive: true });
+  const steps: string[] = [];
+  log(`live test: scenario ${name} — projectDir=${projectDir}`);
 
   // --- Build the sample project (base commit: red test, code not yet fixed).
   writeFileSync(join(projectDir, "package.json"), SAMPLE_PACKAGE_JSON);
@@ -319,7 +496,7 @@ export async function runLiveTest(options?: {
   await runOrThrow("git commit", "git", ["commit", "-qm", "base: sample project"], projectDir);
   const baseCommit = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
   const briefSha256 = createHash("sha256").update(SAMPLE_BRIEF).digest("hex");
-  log(`live test: base commit ${baseCommit}`);
+  log(`live test: scenario ${name}: base commit ${baseCommit}`);
   await runApos(cli, projectDir, ["init"]);
   await runApos(cli, projectDir, [
     "goal",
@@ -329,53 +506,19 @@ export async function runLiveTest(options?: {
     "--source",
     "brief.md",
   ]);
-  log(`live test: created ${LIVE_GOAL_ID} (draft)`);
+  log(`live test: scenario ${name}: created ${LIVE_GOAL_ID} (draft)`);
 
-  // --- Drive the real loop: read real state -> nextStep -> execute the step.
+  // --- Drive the real Goal ONLY through the subprocess drive runner.
   // The plan's baseCommit is set at lead-propose time (see below): it
   // must be HEAD after APOS's own auto-commits (init, goal-approved),
   // otherwise the delivery diff against the base would contain
   // APOS-managed .apos files and the gate would go red (APOS-PROTECTED).
-  const runState = createRunState();
+  let pendingHandover: string | null = null;
   let verified = false;
-
-  /**
-   * Run `package submit` with a verified handover commit and consume the
-   * handover (the commit is never submitted twice, whatever the gate
-   * said). Returns the gate result ("green" | "red" | other).
-   */
-  const submitHandover = async (commit: string): Promise<string> => {
-    const out = await runCommand(
-      "node",
-      [cli, "--repo", projectDir, "package", "submit", LIVE_GOAL_ID, LIVE_PACKAGE_ID, "--commit", commit, "--json"],
-      projectDir,
-    );
-    consumeHandover(runState, commit);
-    const parsed = JSON.parse(out.stdout) as { result?: unknown; goalStatus?: unknown };
-    const result = String(parsed.result ?? "?");
-    log(`live: package-submit ${commit} -> ${result} (exit ${out.exitCode})`);
-    if (out.exitCode === 0 && result === "green") {
-      return "green";
-    }
-    if (result === "red") {
-      markRed(runState, commit);
-      log(`live: gate red for ${commit}; loop goes back to worker-fix`);
-      return "red";
-    }
-    throw new Error(
-      `live: package submit did not go green or red (exit ${out.exitCode}): ` +
-        `${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
-    );
-  };
   for (let iteration = 0; iteration < 20; iteration += 1) {
-    const rawState = await readGoalState(projectDir, LIVE_GOAL_ID);
-    const state = applyHandover(rawState, runState);
-    const step = nextStep(state);
+    const step = await drive(projectDir, name, pendingHandover ?? undefined, log);
     steps.push(step.action);
-    log(
-      `live: ${state.status} / package ${state.packageStatus} / ` +
-        `attempts ${state.attemptsUsed}/${state.attemptsMax} -> ${step.action} — ${step.reason}`,
-    );
+    log(`live: ${name}: ${step.status ?? "?"} -> ${step.action}`);
     if (step.action === "wait-human-approve") {
       // Pty provisioning (see the header note): the fixture Goal is
       // approved by typing its id back on the TTY.
@@ -390,7 +533,7 @@ export async function runLiveTest(options?: {
           `pty goal approve failed (exit ${out.exitCode}): ${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
         );
       }
-      log(`live: pty approved ${LIVE_GOAL_ID}`);
+      log(`live: ${name}: pty approved ${LIVE_GOAL_ID}`);
       continue;
     }
     if (step.action === "wait-human-select") {
@@ -405,7 +548,7 @@ export async function runLiveTest(options?: {
           `pty goal select failed (exit ${out.exitCode}): ${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
         );
       }
-      log(`live: pty selected ${LIVE_GOAL_ID}`);
+      log(`live: ${name}: pty selected ${LIVE_GOAL_ID}`);
       continue;
     }
     if (step.action === "lead-propose") {
@@ -414,90 +557,127 @@ export async function runLiveTest(options?: {
       // a baseCommit from before those commits would make the delivery
       // diff contain APOS-managed .apos files (gate red, APOS-PROTECTED).
       const planBase = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
-      runState.baseCommit = planBase;
       writeFileSync(
         join(projectDir, "execution.json"),
         sampleExecutionJson(planBase, briefSha256),
       );
-      log(`live: plan baseCommit ${planBase}`);
+      log(`live: ${name}: plan baseCommit ${planBase}`);
       await runApos(cli, projectDir, ["lead", "propose", "--file", "execution.json"]);
       steps.push("lead-commit");
-      log("live: lead-propose done (execution.json proposed)");
+      log(`live: ${name}: lead-propose done (execution.json proposed)`);
       await runApos(cli, projectDir, ["lead", "commit", LIVE_GOAL_ID]);
-      log("live: lead-commit done (plan accepted, Goal executing)");
+      log(`live: ${name}: lead-commit done (plan accepted, Goal executing)`);
       continue;
     }
     if (step.action === "worker-write-code" || step.action === "worker-fix") {
-      // The worker step in this sample: apply the predetermined patch
-      // (worker-write-code) or, after a red gate, a new commit on top
-      // (worker-fix) — the loop's job here is proving the transition,
-      // not an agent's reasoning.
+      // The worker step in this sample: apply the predetermined patch.
+      // green-first writes the correct greet at once; red-then-green
+      // writes the wrong greet first (gate goes red) and the fix only
+      // on worker-fix. The loop's job here is proving the transition,
+      // not an agent's reasoning. The commit SHA is handed to the next
+      // drive call as --handover; the runner verifies it with git.
+      let content: string;
+      let message: string;
       if (step.action === "worker-fix") {
-        writeFileSync(
-          join(projectDir, "greet.mjs"),
-          `${SAMPLE_GREET_FIXED}\n// fix: keep the greeting exact\n`,
-        );
+        content = `${SAMPLE_GREET_FIXED}\n// fix: keep the greeting exact\n`;
+        message = "worker-fix: keep greeting exact";
+      } else if (wrongFirst) {
+        content = SAMPLE_GREET_WRONG;
+        message = "worker: first attempt (wrong greeting)";
       } else {
-        writeFileSync(join(projectDir, "greet.mjs"), SAMPLE_GREET_FIXED);
+        content = SAMPLE_GREET_FIXED;
+        message = "worker: greet returns xin chào";
       }
+      writeFileSync(join(projectDir, "greet.mjs"), content);
       await runOrThrow("git add", "git", ["add", "-A"], projectDir);
-      await runOrThrow(
-        "git commit",
-        "git",
-        ["commit", "-qm", step.action === "worker-fix" ? "worker-fix: keep greeting exact" : "worker: greet returns xin chào"],
-        projectDir,
-      );
+      await runOrThrow("git commit", "git", ["commit", "-qm", message], projectDir);
       const handover = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
-      recordHandover(runState, handover);
-      const verification = await verifyHandover(runState, projectDir);
-      log(`live: ${step.action} handed over ${handover} — ${verification.reason}`);
-      if (!verification.verified) {
-        throw new Error(`live: handover verification failed: ${verification.reason}`);
-      }
-      if (step.action === "worker-fix") {
-        // The machine answers worker-fix while the package is still red
-        // even with a NEW handover ("fix first, submit the new commit
-        // after"): the fix step's completion IS the new handover, so
-        // the loop submits it now instead of asking for another fix
-        // (re-reading would answer worker-fix again — the red outcome
-        // only changes after a submit). This keeps the red path from
-        // stalling the same way the code-ready path used to.
-        steps.push("package-submit");
-        await submitHandover(handover);
-      }
+      pendingHandover = handover;
+      log(`live: ${name}: ${step.action} handed over ${handover} (next drive call passes it as --handover)`);
       continue;
     }
     if (step.action === "package-submit") {
       const commit = step.handoverCommit;
       if (commit === undefined) {
-        throw new Error("live: package-submit step carries no handover commit");
+        // Already submitted and waiting on the gate outcome; ask the
+        // runner again (the iteration cap guards against looping here).
+        log(`live: ${name}: package-submit carries no handover commit (already submitted); asking the runner again`);
+        continue;
       }
-      await submitHandover(commit);
+      await submitPackage(cli, projectDir, commit, log);
+      pendingHandover = null;
       continue;
     }
     if (step.action === "wait-human-close") {
       // Human gate: the loop stops here and does NOT close the Goal.
-      verified = state.status === "verified";
+      verified = step.status === "verified";
       log(
-        `live: stopped at human gate wait-human-close (status ${state.status}); ` +
+        `live: ${name}: stopped at human gate wait-human-close (status ${step.status}); ` +
           "the loop does not close the Goal.",
       );
       break;
     }
     if (step.action === "done") {
-      verified = state.status === "verified" || state.status === "closed";
+      verified = step.status === "verified" || step.status === "closed";
       break;
     }
-    throw new Error(`live: unexpected step ${step.action} — the driver cannot execute it`);
+    throw new Error(`live: unexpected step ${step.action} in scenario ${name} — the driver cannot execute it`);
   }
   if (!verified) {
     throw new Error(
-      `live test did not reach verified (steps: ${steps.join(" -> ")}); ` +
+      `live test scenario ${name} did not reach verified (steps: ${steps.join(" -> ")}); ` +
         "see the log above for where it stopped",
     );
   }
-  log(`live test: ok — ${LIVE_GOAL_ID} verified via ${steps.join(" -> ")}`);
-  return { goalId: LIVE_GOAL_ID, projectDir, steps, verified, log: logLines.join("\n") };
+  log(`live test: scenario ${name} ok — ${LIVE_GOAL_ID} verified via ${steps.join(" -> ")}`);
+  return { name, steps, verified, projectDir };
+}
+
+/**
+ * Build the sample APOS projects in `baseDir` and drive two real Goals
+ * from `selected` to green ONLY through the drive runner, returning the
+ * step sequences and the evidence log. Throws when a Goal does not
+ * verify or a step the driver cannot execute appears.
+ */
+export async function runLiveTest(options?: {
+  baseDir?: string;
+}): Promise<LiveTestResult> {
+  const cli = resolveAposCli();
+  const baseDir =
+    options?.baseDir ?? mkdtempSync(join(tmpdir(), "apos-orchestrator-live-"));
+
+  const logLines: string[] = [];
+  const log = (line: string): void => {
+    logLines.push(line);
+    console.log(line);
+  };
+  log(
+    "live test: provisioning dùng một lần — Goal mẫu do chính test tạo " +
+      "trong thư mục tạm; approve/select được xác nhận tương tác qua pty " +
+      "(gõ lại ID trên TTY), không dùng --on-behalf, không sửa tay state " +
+      ".apos/controller.",
+  );
+  log(`live test: baseDir=${baseDir}`);
+  await ensureRunnerBuilt(log);
+
+  const scenarios: LiveScenarioResult[] = [];
+  const steps: string[] = [];
+  scenarios.push(await runScenario("green-first", false, baseDir, cli, log));
+  scenarios.push(await runScenario("red-then-green", true, baseDir, cli, log));
+  for (const scenario of scenarios) {
+    steps.push(...scenario.steps);
+  }
+  const verified = scenarios.every((scenario) => scenario.verified);
+  const projectDir = scenarios[0]?.projectDir ?? join(baseDir, "green-first", "sample");
+  log(`live test: ok — ${LIVE_GOAL_ID} verified in both scenarios via drive runner`);
+  return {
+    goalId: LIVE_GOAL_ID,
+    projectDir,
+    steps,
+    verified,
+    log: logLines.join("\n"),
+    scenarios,
+  };
 }
 
 /** CLI entry for `npm run test:live` (see src/dry-run.ts for the pattern). */

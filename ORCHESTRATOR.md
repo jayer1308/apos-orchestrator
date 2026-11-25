@@ -52,7 +52,8 @@ từng dòng). Khi các điều kiện chồng nhau, trạng thái package khác
 | executing, chưa có package, code-ready đã kiểm chứng (handover commit) | package-submit | không — submit đúng commit handover đó |
 | executing, chưa có package, handover đã submit hoặc đã đỏ | worker-write-code | không — không bao giờ submit lại commit đó |
 | executing, package pending | package-submit | không |
-| executing, package red, còn lượt thử | worker-fix | không — Worker sửa code rồi submit commit mới |
+| executing, package red, còn lượt thử, handover mới đã kiểm chứng | package-submit | không — submit đúng commit handover mới đó |
+| executing, package red, còn lượt thử, không có handover mới đã kiểm chứng | worker-fix | không — Worker sửa code rồi bàn giao commit mới |
 | executing, package red, hết lượt thử | report-human-blocked | có — dừng, báo cáo human |
 | executing, package green | wait-human-close | có — chờ human close |
 | executing, package needs-human | report-human-blocked | có — dừng, báo cáo human |
@@ -101,14 +102,19 @@ chứng bằng git, `applyHandover` gộp vào `GoalState` cho `nextStep`,
 (commit được ghi vào `submittedCommits`, lần đọc sau thấy package
 `pending`/`red` nên machine không còn xét codeReady cho nó nữa),
 `markRed` ghi commit đã đỏ. Gate đỏ → `worker-fix` sinh handover **mới**
-thay commit cũ; commit đã đỏ không bao giờ được submit lại. Lưu ý ở
-đường đỏ: khi package còn `red`, machine vẫn trả `worker-fix` kể cả khi
-đã có handover mới ("fix first, submit the new commit after") — trạng
-thái `red` chỉ đổi sau một lần submit — nên vòng lặp thực thi bước
-`worker-fix` bằng cách fix xong submit ngay handover mới đó, thay vì
-hỏi lại machine rồi lại nhận `worker-fix`. Nếu `package-submit` không
-chạy được (lỗi lệnh, không phải gate đỏ) thì handover được giữ nguyên
-và vòng sau thử submit lại, trong giới hạn `attemptsMax`.
+thay commit cũ; commit đã đỏ không bao giờ được submit lại. Nếu
+`package-submit` không chạy được (lỗi lệnh, không phải gate đỏ) thì
+handover được giữ nguyên và vòng sau thử submit lại, trong giới hạn
+`attemptsMax`.
+
+Luật machine ở đường đỏ (GOAL-003): khi package đang `red` và còn lượt
+thử, machine kiểm tra handover mới trước khi trả `worker-fix` — handover
+mới đã kiểm chứng (code-ready, commit chưa submit/chưa đỏ) thì bước tiếp
+theo là `package-submit` với đúng commit đó; không có handover mới đã
+kiểm chứng thì vẫn `worker-fix`. Quy ước cũ không còn nữa: luật nằm
+trong hàm thuần túy `nextStep` nên test được bằng vitest và dry-run, và
+hành vi quan sát được giống nhau (không hỏi lại machine rồi lại nhận
+`worker-fix` cho cùng một lần đỏ).
 
 ### Runner live (GOAL-002)
 
@@ -118,11 +124,58 @@ gọi `nextStep`, in bước tiếp theo cùng nguồn `attemptsMax`. Runner ch�
 gọi lệnh đọc của CLI; gặp human gate thì chỉ in và dừng, không chạy lệnh
 human-gated nào. Không còn placeholder trong `src/index.ts`.
 
+### Chế độ drive (GOAL-003)
+
+`npm run live -- --repo <project> --goal <id> --drive [--handover <sha>]`
+tự lái trọn một Goal: mỗi lần gọi, runner load trạng thái chạy đã lưu,
+đối chiếu với trạng thái reader, nhận `--handover` nếu có, rồi in bước
+tiếp theo — người lái chỉ chạy bước đó rồi gọi lại runner. Không có
+`--drive` thì runner giữ nguyên hành vi chỉ-đọc (cờ `--handover` bị bỏ
+qua, không tạo file trạng thái).
+
+- **Nhận handover (`--handover <sha>`)** — người lái truyền SHA commit
+  Worker vừa bàn giao. Runner kiểm chứng commit đó bằng git (tồn tại,
+  là hậu duệ của `baseCommit` của plan, khác `baseCommit`, chưa từng
+  submit/chưa từng đỏ) rồi mới trả `package-submit` với đúng commit đó;
+  handover chưa kiểm chứng được coi như chưa có code
+  (`worker-write-code`). Runner không bao giờ đoán commit handover từ
+  git log.
+- **Giữ trạng thái chạy (file trạng thái)** — `LoopRunState` được lưu ra
+  file JSON tại
+  `$HOME/.apos-orchestrator/drive-state/<sha256(đường dẫn tuyệt đối của project)>-<goalId>.json`
+  (xem `src/drive-state.ts`: `driveStatePath`, `loadDriveState`,
+  `saveDriveState`). File nằm ngoài repo — không nằm trong repo, nên
+  không bao giờ lọt vào diff nộp gate — và tách riêng theo từng project
+  + goal. Hai người lái cùng một project + goal cùng lúc có thể ghi đè
+  lẫn nhau (last-write-wins); giả định một người lái tại một thời điểm.
+- **Đối chiếu (reconcile)** — runner chỉ in bước, việc submit do người
+  lái chạy, nên lần gọi sau suy ra submit đã chạy từ trạng thái reader:
+  handover mà lần gọi trước đã in `package-submit` thì được tiêu thụ
+  vào `submittedCommits` khi reader thấy package `pending`/`red`/
+  `green`, và ghi thêm vào `redCommits` khi package `red` — commit đã
+  submit hoặc đã đỏ không bao giờ được submit lại.
+- **`baseCommit` để kiểm chứng** — đọc từ khối JSON trong file đã commit
+  `<repo>/.apos/goals/<goal>/execution.md` của project đích. Nếu không
+  đọc được (thiếu file, không có khối JSON, parse lỗi, không có
+  `baseCommit`), runner chỉ kiểm tra commit tồn tại + chưa submit/chưa
+  đỏ và in cảnh báo rõ là đã bỏ qua kiểm tra hậu duệ của `baseCommit`.
+- **Đường đỏ** — xem luật machine ở mục "Tín hiệu code-ready" bên trên:
+  package `red` + còn lượt thử + handover mới đã kiểm chứng thì
+  `package-submit` với commit mới đó; không có handover mới thì
+  `worker-fix`.
+- **Human gate** — chế độ drive dừng đúng ở human gate như runner
+  thường (`wait-human-approve`, `wait-human-select`,
+  `wait-human-close`, `report-human-blocked`): chỉ in và dừng, không
+  chạy lệnh human-gated nào và không dùng `--on-behalf`.
+
 ### Gate đỏ và số lần thử
 
 Khi `package submit` trả về exit 1 (gate đỏ), vòng lặp quay lại bước
 worker sửa code (`worker-fix`) rồi submit lại **commit mới** — không bao
-giờ submit lại cùng một commit đã đỏ. Hết số lần thử tối đa thì vòng lặp
+giờ submit lại cùng một commit đã đỏ. Ở chế độ drive, sau khi Worker
+fix xong bàn giao handover mới, lần gọi runner tiếp theo với
+`--handover <sha mới>` trả `package-submit` với commit đó (luật machine
+đường đỏ, xem mục "Tín hiệu code-ready"). Hết số lần thử tối đa thì vòng lặp
 dừng và báo cáo human (`report-human-blocked`).
 
 Số lần thử tối đa (`attemptsMax`): reader quét các output CLI nó đã đọc
@@ -257,5 +310,7 @@ khác 0.
 - `npm run live -- --repo <project> --goal <id>` — runner live: đọc
   trạng thái thật qua CLI và in bước tiếp theo.
 - `npm run test:live` — `node dist/live-test.js`: tự dựng project mẫu
-  trong thư mục tạm và lái một Goal thật từ selected tới green qua vòng
-  lặp thật (xem ghi chú provisioning pty trong `src/live-test.ts`).
+  trong thư mục tạm và lái hai Goal thật từ selected tới green chỉ bằng
+  runner ở chế độ drive — kịch bản `green-first` (green ngay lần nộp
+  đầu) và `red-then-green` (đỏ một lần rồi green sau fix) — xem ghi chú
+  provisioning pty trong `src/live-test.ts`.

@@ -15,6 +15,9 @@ Ba phần:
 3. **Agent loop** — lặp: đọc trạng thái → gọi đúng role agent (theo skill
    trong `.apos/skills` của project đích) → kiểm chứng bằng lệnh APOS.
    Không bao giờ tự chạy lệnh chỉ human được chạy; gặp gate human thì
-   dừng lại và báo cáo.
+   dừng lại và báo cáo. Chế độ drive (`npm run live -- --repo <project>
+   --goal <id> --drive [--handover <sha>]`) giữ trạng thái chạy qua các
+   lần gọi trong file `$HOME/.apos-orchestrator/drive-state/` (xem
+   ORCHESTRATOR.md).
 
 Phát triển qua chính APOS (xem `brief.md` và Goal trong `.apos/`).

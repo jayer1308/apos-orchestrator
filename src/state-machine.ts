@@ -165,6 +165,28 @@ export function nextStep(state: GoalState): Step {
       );
     case "red":
       if (state.attemptsUsed < state.attemptsMax) {
+        // Red path (GOAL-003, AC-3): a NEW handover already verified
+        // (codeReady true, commit never submitted / never red) goes
+        // straight to package-submit with that commit — the fix is
+        // done, so asking for another worker-fix for the same red gate
+        // would stall the loop. Red with no (or unverified) new
+        // handover still goes to worker-fix.
+        const handover = state.handoverCommit ?? null;
+        const submitted = state.submittedCommits ?? [];
+        const red = state.redCommits ?? [];
+        if (
+          state.codeReady === true &&
+          handover !== null &&
+          !submitted.includes(handover) &&
+          !red.includes(handover)
+        ) {
+          return step(
+            "package-submit",
+            `The gate went red with attempts left and the Worker handed over a new verified commit ${handover}; the Lead submits that commit for the gate check.`,
+            false,
+            handover,
+          );
+        }
         return step(
           "worker-fix",
           "The gate went red with attempts left; the Worker fixes the code and submits a new commit.",
