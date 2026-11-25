@@ -1,0 +1,79 @@
+# EXEC-2 v1: solo-direct
+
+Fix the worker->submit transition with an explicit code-ready signal, then add the real live runner and a self-contained live test. (1) Code-ready: extend GoalState with `codeReady: boolean` and `handoverCommit: string | null`. The signal comes from the loop's own handover record, not from CLI output: the coordinator that dispatches the Worker receives the Worker's handover commit SHA and records it for the next loop iteration (loop-level run state). Before the machine trusts it, the loop verifies the commit exists in the target repo, is a descendant of the plan's baseCommit, is not the baseCommit itself, and has never been submitted (tracked submitted-commit set); an unverified handover is treated as 'no code' (worker-write-code) with a warning, never submitted. State machine rule: executing + packageStatus none + verified code-ready -> package-submit with that commit; executing + packageStatus none + no verified handover -> worker-write-code. The handover is consumed on submit: after package-submit runs the commit is recorded as submitted, so the next read shows packageStatus pending/red and the machine no longer consults codeReady for it. A red gate -> worker-fix produces a NEW handover commit replacing the old one; a red commit is never re-submitted. If package-submit fails to run (not a red gate), the handover stays and the next iteration retries package-submit, bounded by attemptsMax. The reader keeps its CLI-only contract (no direct controller-file reads); dry-run gains a code-ready scenario that walks real states instead of injecting 'pending' from nowhere. (2) Live runner: replace the src/index.ts placeholder with the real entry: parse --repo/--goal, call readGoalState, call nextStep, print the next step plus the attemptsMax source; add a `live` script to package.json. The runner only calls read-only CLI commands through readGoalState and stops (prints, does not run) at human gates. (3) Appetite: the reader best-effort scans the CLI outputs it already reads (inbox --json, plan --json, goal show, metrics show) for an exposed maxAttempts and uses it when present and valid; otherwise it keeps the default 3 and the live runner prints explicitly that the default is in use because the CLI does not expose appetite (APOS #69). (4) Live test: new `npm run test:live` entry under src/ (e.g. src/live-test.ts) that builds its own sample APOS project in a temp dir, drives a real Goal from selected to green through the real loop, and asserts the step sequence including worker-write-code -> package-submit; it must be self-sufficient because each gate check runs in a fresh worktree (APOS #70). (5) Update ORCHESTRATOR.md: code-ready signal, live runner, appetite reading; keep its state table in sync with the tested machine. No Tester step: the Goal pins no setup, so there are no locked tests; the Worker writes code directly on the plan base.
+
+```json
+{
+  "id": "EXEC-2",
+  "version": 1,
+  "goalId": "GOAL-002",
+  "goalVersion": 1,
+  "mode": "solo-direct",
+  "approach": "Fix the worker->submit transition with an explicit code-ready signal, then add the real live runner and a self-contained live test. (1) Code-ready: extend GoalState with `codeReady: boolean` and `handoverCommit: string | null`. The signal comes from the loop's own handover record, not from CLI output: the coordinator that dispatches the Worker receives the Worker's handover commit SHA and records it for the next loop iteration (loop-level run state). Before the machine trusts it, the loop verifies the commit exists in the target repo, is a descendant of the plan's baseCommit, is not the baseCommit itself, and has never been submitted (tracked submitted-commit set); an unverified handover is treated as 'no code' (worker-write-code) with a warning, never submitted. State machine rule: executing + packageStatus none + verified code-ready -> package-submit with that commit; executing + packageStatus none + no verified handover -> worker-write-code. The handover is consumed on submit: after package-submit runs the commit is recorded as submitted, so the next read shows packageStatus pending/red and the machine no longer consults codeReady for it. A red gate -> worker-fix produces a NEW handover commit replacing the old one; a red commit is never re-submitted. If package-submit fails to run (not a red gate), the handover stays and the next iteration retries package-submit, bounded by attemptsMax. The reader keeps its CLI-only contract (no direct controller-file reads); dry-run gains a code-ready scenario that walks real states instead of injecting 'pending' from nowhere. (2) Live runner: replace the src/index.ts placeholder with the real entry: parse --repo/--goal, call readGoalState, call nextStep, print the next step plus the attemptsMax source; add a `live` script to package.json. The runner only calls read-only CLI commands through readGoalState and stops (prints, does not run) at human gates. (3) Appetite: the reader best-effort scans the CLI outputs it already reads (inbox --json, plan --json, goal show, metrics show) for an exposed maxAttempts and uses it when present and valid; otherwise it keeps the default 3 and the live runner prints explicitly that the default is in use because the CLI does not expose appetite (APOS #69). (4) Live test: new `npm run test:live` entry under src/ (e.g. src/live-test.ts) that builds its own sample APOS project in a temp dir, drives a real Goal from selected to green through the real loop, and asserts the step sequence including worker-write-code -> package-submit; it must be self-sufficient because each gate check runs in a fresh worktree (APOS #70). (5) Update ORCHESTRATOR.md: code-ready signal, live runner, appetite reading; keep its state table in sync with the tested machine. No Tester step: the Goal pins no setup, so there are no locked tests; the Worker writes code directly on the plan base.",
+  "risks": [
+    "The live test needs a sample project whose Goal reaches 'selected', but goal approve/select are human-gated: the Worker must find a legitimate self-provisioning path inside the test's own temp project (e.g. driving the CLI's interactive confirmation through a pty); if none exists that is an APOS finding to route back, not a reason to edit .apos state or controller files by hand",
+    "APOS CLI text output for goal show / metrics show may change format; the reader text parsers are pinned by tests against recorded samples",
+    "Appetite is still not exposed by any CLI command (APOS #69), so the default-3 path with an explicit log line is the behaviour until the CLI changes; the reader must prefer a CLI value when one appears",
+    "Dry-run scripted states must walk through the code-ready state; a scenario that injects 'pending' from nowhere would hide the same bug class again"
+  ],
+  "baseCommit": "c4c5b0ca6799773e85a155925a561079a6648aee",
+  "sourceSha256": "3cd2b7dc9c2bcea9781ee586773609cbc44784e7f5a89e13999acfa0972b0848",
+  "estimatedCost": {
+    "wallMinutes": 180
+  },
+  "rationale": "One cohesive fix to a single loop: the state machine, the reader, the runner and the live test share the same GoalState type and are verified together by one test suite; splitting would add interface overhead without an independent seam.",
+  "sharedPaths": [],
+  "paths": [
+    "src/**",
+    "ORCHESTRATOR.md",
+    "package.json",
+    "vitest.config.ts",
+    "README.md"
+  ],
+  "stubPaths": [
+    "src/state-machine.ts",
+    "src/state-reader.ts",
+    "src/loop.ts",
+    "src/index.ts",
+    "src/live-test.ts"
+  ],
+  "entries": [
+    "readGoalState",
+    "nextStep",
+    "isHumanGated",
+    "runDryRun",
+    "runLive"
+  ],
+  "acceptanceMapping": [
+    {
+      "acceptanceId": "AC-1",
+      "verification": "vitest: state machine returns package-submit (with the handover commit) for executing + package none + verified code-ready, and worker-write-code only when no verified handover exists; live-test (CHK-4) drives a real Goal through worker-write-code -> package-submit"
+    },
+    {
+      "acceptanceId": "AC-2",
+      "verification": "vitest + live run: `npm run live -- --repo <project> --goal <id>` reads real state via readGoalState and prints the next step; src/index.ts has no placeholder"
+    },
+    {
+      "acceptanceId": "AC-3",
+      "verification": "vitest: reader scans CLI outputs for appetite when present and returns it; when absent returns attemptsMax 3 and the live runner prints that the default is in use (APOS #69)"
+    },
+    {
+      "acceptanceId": "AC-4",
+      "verification": "npm run test:live (CHK-4): self-contained live test builds its own sample project and drives a real Goal from selected to green, logging the step sequence"
+    },
+    {
+      "acceptanceId": "AC-5",
+      "verification": "npm test (CHK-1): all pre-existing tests pass unchanged in behaviour; state machine, state reader and dry-run keep their tested behaviour"
+    },
+    {
+      "acceptanceId": "AC-6",
+      "verification": "npm run build (CHK-2) passes"
+    },
+    {
+      "acceptanceId": "AC-7",
+      "verification": "vitest: ORCHESTRATOR.md documents the code-ready signal, the live runner and appetite reading, and its state table matches the tested state machine"
+    }
+  ],
+  "verificationStrategy": "Run npm test, npm run build, npm run dry-run and npm run test:live (the Goal checks CHK-1, CHK-2, CHK-3, CHK-4); the live-test log is the evidence for AC-4"
+}
+```

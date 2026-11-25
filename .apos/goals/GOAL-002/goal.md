@@ -1,6 +1,6 @@
 # GOAL-002 v1: Sửa bộ orchestration: vòng lặp live đi được từ worker-write-code tới package-submit (tín hiệu code-ready), có runner live thật và đọc được appetite khi CLI có — chứng minh bằng live-test trên Goal thật.
 
-Status: approved
+Status: executing
 
 ```json
 {
