@@ -16,6 +16,20 @@ export type GoalStatus =
 
 export type PackageStatus = "none" | "pending" | "red" | "green" | "needs-human";
 
+/**
+ * Per-package state (GOAL-004, WP-CORE): the same Solo fields, scoped
+ * to one work package. The scalar fields of `GoalState` below stay the
+ * Solo / WP-MAIN projection, so `nextStep` is unchanged when a Goal has
+ * no `packages` map.
+ */
+export interface PackageState {
+  status: PackageStatus;
+  codeReady?: boolean;
+  handoverCommit?: string | null;
+  submittedCommits?: readonly string[];
+  redCommits?: readonly string[];
+}
+
 export interface GoalState {
   goalId: string;
   status: GoalStatus;
@@ -40,6 +54,20 @@ export interface GoalState {
   redCommits?: readonly string[];
   /** Where attemptsMax came from: the CLI ("cli") or the default ("default"). */
   attemptsMaxSource?: "cli" | "default";
+  /**
+   * Per-package states (GOAL-004, WP-CORE). Absent for a Solo Goal (or
+   * a reader that has not read them yet); `nextStep` ignores this map
+   * and answers from the scalar fields above, unchanged.
+   */
+  packages?: Record<string, PackageState>;
+  /**
+   * Integration gate state (GOAL-004, WP-CORE): "none" before any
+   * integration gate ran, "gate-pending" while its outcome is unknown,
+   * "gate-green" once the integration gate went green — then the next
+   * step is `integration-complete`. The reader populates this; the
+   * pure machine only reads it.
+   */
+  integrationStatus?: "none" | "gate-pending" | "gate-green";
 }
 
 export type StepAction =
@@ -53,12 +81,21 @@ export type StepAction =
   | "worker-fix"
   | "wait-human-close"
   | "report-human-blocked"
+  | "integration-gate"
+  | "integration-complete"
   | "done";
 
 export interface Step {
   action: StepAction;
   reason: string;
   humanGate: boolean;
+  /**
+   * The package this step is for (GOAL-004, WP-CORE): set on
+   * per-package steps (`nextStepForPackage`), so the driver knows
+   * which package to submit / fix. Absent on Solo steps from
+   * `nextStep`, which carry no package.
+   */
+  packageId?: string;
   /**
    * The handover commit a package-submit step carries (GOAL-002): the
    * verified Worker commit to submit. Absent on every other step — in
@@ -269,6 +306,23 @@ export function nextStep(state: GoalState): Step {
     "No package submitted yet; the Worker writes the code.",
     false,
   );
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * the next step for one package of a Multi-WP Goal. It applies the
+ * `nextStep` rules scoped to `packageId` (that package's pending /
+ * red / green / none status, its code-ready handover, its red +
+ * new-handover path), and answers the goal-level integration steps:
+ * when every package is green it returns `integration-gate`, and once
+ * the integration gate went green (`integrationStatus: "gate-green"`)
+ * it returns `integration-complete`. A Goal with no `packages` map
+ * (Solo) answers exactly like `nextStep` for the same state.
+ */
+export function nextStepForPackage(state: GoalState, packageId: string): Step {
+  void state;
+  void packageId;
+  throw new Error("not implemented");
 }
 
 /**

@@ -210,7 +210,11 @@ describe("AC-1: state machine returns the next Solo step for every Goal state", 
   });
 
   it("AC-3: each next step flags whether a human gate stops the loop", () => {
-    const inputs: Record<Exclude<StepAction, "lead-commit">, Partial<GoalState>> = {
+    // "integration-gate" / "integration-complete" are per-package
+    // steps from `nextStepForPackage` (GOAL-004), not `nextStep`
+    // results — excluded here like "lead-commit" below.
+    type SoloAction = Exclude<StepAction, "lead-commit" | "integration-gate" | "integration-complete">;
+    const inputs: Record<SoloAction, Partial<GoalState>> = {
       "wait-human-approve": { status: "draft" },
       "wait-human-select": { status: "approved" },
       "lead-propose": { status: "selected" },
@@ -228,7 +232,7 @@ describe("AC-1: state machine returns the next Solo step for every Goal state", 
       done: { status: "closed" },
     };
     // "lead-commit" is a dry-run phase step, not a nextStep result.
-    const expectedWithoutLeadCommit: Record<Exclude<StepAction, "lead-commit">, boolean> = {
+    const expectedWithoutLeadCommit: Record<SoloAction, boolean> = {
       "wait-human-approve": true,
       "wait-human-select": true,
       "lead-propose": false,
@@ -241,7 +245,7 @@ describe("AC-1: state machine returns the next Solo step for every Goal state", 
       done: false,
     };
     for (const [action, input] of Object.entries(inputs) as Array<
-      [Exclude<StepAction, "lead-commit">, Partial<GoalState>]
+      [SoloAction, Partial<GoalState>]
     >) {
       const step = nextStep(state(input));
       expect(step.action).toBe(action);

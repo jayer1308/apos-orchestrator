@@ -32,6 +32,11 @@ export interface LoopRunState {
   submittedCommits: string[];
   /** Commits that went red at the gate (never re-submitted). */
   redCommits: string[];
+  /**
+   * Per-package run states (GOAL-004, WP-CORE). Absent for a Solo
+   * Goal; the scalar fields above stay the Solo projection.
+   */
+  packages?: Record<string, PackageRunState>;
 }
 
 /** Fresh loop run state, optionally anchored at the plan's baseCommit. */
@@ -43,6 +48,113 @@ export function createRunState(baseCommit?: string | null): LoopRunState {
     submittedCommits: [],
     redCommits: [],
   };
+}
+
+/**
+ * Per-package run state (GOAL-004, WP-CORE): the same handover record
+ * as `LoopRunState`, scoped to one work package. The scalar fields of
+ * `LoopRunState` stay the Solo / WP-MAIN projection; the per-package
+ * functions below are the Multi-WP variants, and the Solo functions
+ * keep working on the scalar fields.
+ */
+export interface PackageRunState {
+  /** Commit SHA the Worker handed over for this package, or null. */
+  handoverCommit: string | null;
+  /** True only after `verifyHandoverForPackage` confirmed the handover. */
+  codeReady: boolean;
+  /** Commits already submitted for this package (never re-submitted). */
+  submittedCommits: string[];
+  /** Commits that went red for this package (never re-submitted). */
+  redCommits: string[];
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * record a Worker's handover commit for one package; unverified until
+ * `verifyHandoverForPackage` passes. Other packages are untouched.
+ */
+export function recordHandoverForPackage(
+  runState: LoopRunState,
+  packageId: string,
+  commit: string,
+): void {
+  void runState;
+  void packageId;
+  void commit;
+  throw new Error("not implemented");
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * verify one package's handover commit with git (exists, descendant
+ * of `baseCommit`, not `baseCommit` itself, never submitted and never
+ * red — for this package or any other: a commit that went red for ANY
+ * package is never submitted again). On success the package's run
+ * state is marked code-ready.
+ */
+export async function verifyHandoverForPackage(
+  runState: LoopRunState,
+  packageId: string,
+  projectDir: string,
+): Promise<HandoverVerification> {
+  void runState;
+  void packageId;
+  void projectDir;
+  throw new Error("not implemented");
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * fold one package's run state into a GoalState for
+ * `nextStepForPackage`: the machine sees that package's codeReady /
+ * handoverCommit / submittedCommits / redCommits through
+ * `state.packages[packageId]`. Other packages are untouched, and the
+ * reader's GoalState is never mutated.
+ */
+export function applyHandoverForPackage(
+  state: GoalState,
+  runState: LoopRunState,
+  packageId: string,
+): GoalState {
+  void state;
+  void runState;
+  void packageId;
+  throw new Error("not implemented");
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * consume one package's handover after its package-submit ran with
+ * it: the commit is recorded as submitted for that package only, so
+ * it is never submitted again for any package.
+ */
+export function consumeHandoverForPackage(
+  runState: LoopRunState,
+  packageId: string,
+  commit: string,
+): void {
+  void runState;
+  void packageId;
+  void commit;
+  throw new Error("not implemented");
+}
+
+/**
+ * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
+ * record that a submitted commit went red for one package: it is
+ * never re-submitted for that package or any other. A red gate goes
+ * back to worker-fix for that package, which produces a NEW handover
+ * commit replacing the old one.
+ */
+export function markRedForPackage(
+  runState: LoopRunState,
+  packageId: string,
+  commit: string,
+): void {
+  void runState;
+  void packageId;
+  void commit;
+  throw new Error("not implemented");
 }
 
 /** Record a Worker's handover commit; it is unverified until `verifyHandover` passes. */
