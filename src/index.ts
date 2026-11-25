@@ -94,6 +94,31 @@ function parseArgv(argv: readonly string[]): {
   return { repo, goalId, drive, handover };
 }
 
+/** One `--handover` value, parsed per package (GOAL-004, WP-DRIVE). */
+export interface ParsedHandover {
+  /**
+   * The package the handover is for, or `null` for the bare Solo form
+   * `--handover <sha>` (the Goal's only package).
+   */
+  packageId: string | null;
+  /** The Worker commit SHA handed over for that package. */
+  commit: string;
+}
+
+/**
+ * STUB (GOAL-004, WP-DRIVE — Tester step; the Worker implements it):
+ * parse every `--handover` flag from argv. The per-package form
+ * `--handover <pkg>:<sha>` may repeat, once per package; the bare
+ * form `--handover <sha>` is the Solo package. Throws on a malformed
+ * value (empty package, empty or non-hex commit) or on the same
+ * package given twice — the driver must never guess which package a
+ * handover belongs to.
+ */
+export function parseHandoverArgs(argv: readonly string[]): ParsedHandover[] {
+  void argv;
+  throw new Error("not implemented");
+}
+
 /**
  * Read the plan's `baseCommit` from the ```json block in
  * `<repo>/.apos/goals/<goalId>/execution.md`. Returns the baseCommit,
