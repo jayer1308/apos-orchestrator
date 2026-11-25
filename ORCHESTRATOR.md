@@ -47,7 +47,10 @@ từng dòng). Khi các điều kiện chồng nhau, trạng thái package khác
 | selected | lead-propose | không — Lead propose rồi lead-commit |
 | testing | tests-submit | không — Tester đang viết test, submit test |
 | executing, có setup, test chưa khoá, chưa có package | tests-submit | không |
-| executing, không có setup (hoặc test đã khoá), chưa có package | worker-write-code | không |
+| executing, chưa có package, không có code-ready (chưa có handover) | worker-write-code | không |
+| executing, chưa có package, handover chưa kiểm chứng (code-ready false) | worker-write-code | không — cảnh báo ghi tên commit handover trong reason |
+| executing, chưa có package, code-ready đã kiểm chứng (handover commit) | package-submit | không — submit đúng commit handover đó |
+| executing, chưa có package, handover đã submit hoặc đã đỏ | worker-write-code | không — không bao giờ submit lại commit đó |
 | executing, package pending | package-submit | không |
 | executing, package red, còn lượt thử | worker-fix | không — Worker sửa code rồi submit commit mới |
 | executing, package red, hết lượt thử | report-human-blocked | có — dừng, báo cáo human |
@@ -65,6 +68,56 @@ Cột "Dừng ở human gate?" là giá trị `humanGate` mà `nextStep` trả v
 `true` đúng cho các bước chờ human (`wait-human-*`,
 `report-human-blocked`), `false` cho các bước còn lại.
 
+### Tín hiệu code-ready và handover commit (GOAL-002)
+
+Đây là phần sửa lỗi kẹt vòng lặp live ngày 25/11: trước GOAL-002,
+`package-submit` chỉ reachable khi `packageStatus` là `pending`, mà
+`pending` chỉ xuất hiện sau khi đã submit — vòng luẩn quẩn khiến loop
+kẹt ở `worker-write-code` mãi. Nay `GoalState` có thêm tín hiệu
+**code-ready**:
+
+- `handoverCommit: string | null` — SHA commit Worker đã **bàn giao**
+  (handover) cho vòng lặp.
+- `codeReady: boolean` — `true` chỉ khi vòng lặp đã **kiểm chứng** commit
+  đó bằng git: commit tồn tại, là hậu duệ của `baseCommit` của plan,
+  khác `baseCommit`, và chưa từng được submit. State machine thuần túy
+  tin cờ này, không tự chạy git.
+- `submittedCommits: string[]` và `redCommits: string[]` — tập commit đã
+  submit / đã đỏ ở cấp vòng lặp; machine không bao giờ trả về
+  `package-submit` với một commit trong hai tập này.
+
+Luật machine (executing, chưa có package): code-ready đã kiểm chứng thì
+bước tiếp theo là `package-submit` **với đúng commit handover đó**
+(step mang `handoverCommit`); không có handover, hoặc handover chưa
+kiểm chứng, thì `worker-write-code` — handover chưa kiểm chứng được coi
+như "chưa có code", và reason của bước cảnh báo bằng cách **ghi tên SHA
+commit handover** đó. Code-ready thắng nhánh tests-submit: đã có code
+nghĩa là test đã submit rồi.
+
+Vòng lặp giữ handover trong `LoopRunState` (`src/loop.ts`):
+`recordHandover` ghi commit Worker bàn giao, `verifyHandover` kiểm
+chứng bằng git, `applyHandover` gộp vào `GoalState` cho `nextStep`,
+`consumeHandover` tiêu thụ handover sau khi `package-submit` đã chạy
+(commit được ghi vào `submittedCommits`, lần đọc sau thấy package
+`pending`/`red` nên machine không còn xét codeReady cho nó nữa),
+`markRed` ghi commit đã đỏ. Gate đỏ → `worker-fix` sinh handover **mới**
+thay commit cũ; commit đã đỏ không bao giờ được submit lại. Lưu ý ở
+đường đỏ: khi package còn `red`, machine vẫn trả `worker-fix` kể cả khi
+đã có handover mới ("fix first, submit the new commit after") — trạng
+thái `red` chỉ đổi sau một lần submit — nên vòng lặp thực thi bước
+`worker-fix` bằng cách fix xong submit ngay handover mới đó, thay vì
+hỏi lại machine rồi lại nhận `worker-fix`. Nếu `package-submit` không
+chạy được (lỗi lệnh, không phải gate đỏ) thì handover được giữ nguyên
+và vòng sau thử submit lại, trong giới hạn `attemptsMax`.
+
+### Runner live (GOAL-002)
+
+`npm run live -- --repo <project> --goal <id>` chạy entry thật trong
+`src/index.ts` (`runLive`): đọc trạng thái thật qua `readGoalState`,
+gọi `nextStep`, in bước tiếp theo cùng nguồn `attemptsMax`. Runner chỉ
+gọi lệnh đọc của CLI; gặp human gate thì chỉ in và dừng, không chạy lệnh
+human-gated nào. Không còn placeholder trong `src/index.ts`.
+
 ### Gate đỏ và số lần thử
 
 Khi `package submit` trả về exit 1 (gate đỏ), vòng lặp quay lại bước
@@ -72,12 +125,19 @@ worker sửa code (`worker-fix`) rồi submit lại **commit mới** — không 
 giờ submit lại cùng một commit đã đỏ. Hết số lần thử tối đa thì vòng lặp
 dừng và báo cáo human (`report-human-blocked`).
 
-Số lần thử tối đa (`attemptsMax`): không lệnh CLI nào của APOS lộ appetite
-của Goal (đã kiểm chứng: `goal show`, `inbox --json`, `plan --json`,
-`metrics show` đều không có), nên `readGoalState` nhận tham số optional
-thứ tư `options?: { attemptsMax?: number }`, mặc định là **3** — đúng
-appetite đã duyệt của GOAL-001. Giá trị `attemptsMax` trả về luôn ít nhất
-bằng `attemptsUsed`.
+Số lần thử tối đa (`attemptsMax`): reader quét các output CLI nó đã đọc
+(`inbox --json`, `plan --json`, `goal show`, `metrics show`) để tìm
+appetite lộ ra dưới khóa `maxAttempts`. **Lưu ý: tên khóa này là phỏng
+đoán** — hiện chưa lệnh CLI nào lộ appetite (xem APOS #69), nên reader
+tìm khóa `maxAttempts` phòng khi một bản CLI sau này lộ ra. Giá trị
+hiện ra phải là số nguyên dương mới được dùng, và được báo với nguồn
+`attemptsMaxSource: "cli"`. Khi không có lệnh nào lộ appetite thì dùng
+mặc định là **3** với nguồn `"default"` — đúng appetite đã duyệt của
+GOAL-001 — và runner live in rõ là **đang dùng mặc định** vì CLI không
+lộ appetite. `options.attemptsMax` truyền trực tiếp cho `readGoalState`
+vẫn thắng cả hai. Giá trị `attemptsMax` trả về luôn ít nhất bằng
+`attemptsUsed` (một appetite lộ ra mà nhỏ hơn số lần đã dùng thì được
+nâng lên bằng `attemptsUsed`, nguồn vẫn là `"cli"`).
 
 ## Lệnh chỉ human được chạy
 
@@ -136,6 +196,9 @@ thật đã ghi lại trong `src/test-fixtures/`):
 - `packageStatus`: `none` khi chưa submit lần nào; `red` khi mọi package
   đã submit đều đỏ (`redGates` bằng tổng số submit và lớn hơn 0);
   `pending` khi đã submit nhưng chưa có kết quả.
+- `attemptsMax` và `attemptsMaxSource`: xem mục "Tín hiệu code-ready"
+  bên trên — reader quét output CLI tìm `maxAttempts` (phỏng đoán theo
+  APOS #69); không có thì mặc định 3, nguồn `"default"`.
 
 ### Cách resolve APOS CLI
 
@@ -153,7 +216,7 @@ tới CLI.
 
 ## Dry run
 
-`npm run dry-run` chạy `runDryRun()` trong `src/loop.ts` trên ba kịch bản
+`npm run dry-run` chạy `runDryRun()` trong `src/loop.ts` trên bốn kịch bản
 mẫu, đi bộ (walk) các trạng thái mẫu qua `nextStep` thật — chuỗi bước in
 ra là đáp án của state machine, không phải chuỗi hardcode — và dừng ở
 human gate đầu tiên của mỗi kịch bản:
@@ -164,6 +227,11 @@ human gate đầu tiên của mỗi kịch bản:
   package-submit -> wait-human-close
 - `red-gate`: lead-propose -> lead-commit -> worker-write-code ->
   package-submit -> worker-fix -> package-submit -> report-human-blocked
+- `code-ready` (GOAL-002): lead-propose -> lead-commit ->
+  worker-write-code -> package-submit -> wait-human-close — đi qua trạng
+  thái code-ready thật (handover đã kiểm chứng) thay vì chèn `pending`
+  từ hư không như kịch bản cũ; đây là chuỗi đã kẹt ở vòng lặp live
+  trước GOAL-002.
 
 Dry run không tạo commit, không gọi lệnh human-gated nào, không sửa file
 thật. `humanGatedAttempted` là `false` ở mọi kịch bản; nếu chuỗi bước sai
@@ -176,3 +244,8 @@ khác 0.
   đã ghi lại), dry run, và tài liệu này.
 - `npm run build` — `tsc` (strict).
 - `npm run dry-run` — `node dist/dry-run.js`.
+- `npm run live -- --repo <project> --goal <id>` — runner live: đọc
+  trạng thái thật qua CLI và in bước tiếp theo.
+- `npm run test:live` — `node dist/live-test.js`: tự dựng project mẫu
+  trong thư mục tạm và lái một Goal thật từ selected tới green qua vòng
+  lặp thật (xem ghi chú provisioning pty trong `src/live-test.ts`).

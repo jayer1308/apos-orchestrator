@@ -20,10 +20,17 @@
 // - `packageStatus` is "none" with no submits, "red" when every submitted
 //   package hit a red gate (`redGates` equals the submit total and is > 0),
 //   and "pending" otherwise (submitted, no outcome recorded yet).
-// - `attemptsMax`: no APOS CLI command exposes the Goal's appetite, so it
-//   is not read from the CLI. It defaults to 3 — the approved appetite of
-//   GOAL-001 — and can be overridden with `options.attemptsMax`. The value
-//   returned is always at least `attemptsUsed`.
+// - `attemptsMax`: best-effort scan of the CLI outputs already read
+//   (`inbox --json`, `plan --json`, `goal show`, `metrics show`) for an
+//   exposed appetite under the key `maxAttempts` (GOAL-002, APOS #69).
+//   NOTE: the key name is a GUESS — no APOS CLI command exposes appetite
+//   today, so `maxAttempts` is the field name the reader looks for if a
+//   future CLI version exposes it (see APOS #69). A present, valid
+//   (positive integer) value is used and reported with source "cli";
+//   otherwise it defaults to 3 with source "default", and the live
+//   runner prints explicitly that the default is in use. An explicit
+//   `options.attemptsMax` override still wins over a CLI value. The
+//   value returned is always at least `attemptsUsed`.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -49,9 +56,10 @@ export type CliExecutor = (args: readonly string[]) => Promise<CliResult>;
 /** Options for `readGoalState`. */
 export interface ReadGoalStateOptions {
   /**
-   * Maximum number of package-submit attempts for the Goal. No APOS CLI
-   * command exposes the Goal's appetite, so this defaults to 3 (the
-   * approved appetite of GOAL-001). Must be a positive integer when given.
+   * Maximum number of package-submit attempts for the Goal. The reader
+   * first looks for an appetite exposed by the CLI under `maxAttempts`
+   * (APOS #69); this option overrides both the CLI value and the
+   * default 3. Must be a positive integer when given.
    */
   attemptsMax?: number;
 }
@@ -149,16 +157,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * An exposed appetite value is usable only when it is a positive
+ * integer; anything else (0, negative, non-integer, non-number) is
+ * ignored and the default applies (GOAL-002 AC-3).
+ */
+function validMaxAttempts(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1
+    ? value
+    : undefined;
+}
+
+/** Best-effort scan of a text output for `maxAttempts: <n>`. */
+function scanTextForAppetite(stdout: string): number | undefined {
+  const match = /maxAttempts\s*[:=]\s*(\d+)/.exec(stdout);
+  if (match === null) return undefined;
+  return validMaxAttempts(Number(match[1]));
+}
+
 /** Parse `inbox --json`: validates the shape, items are not needed here. */
-function parseInbox(stdout: string): void {
+function parseInbox(stdout: string, goalId: string): number | undefined {
   const parsed = parseJson("inbox", stdout);
   if (!isRecord(parsed) || !Array.isArray(parsed["items"])) {
     throw new Error("inbox: unexpected JSON shape (expected an object with an items array)");
   }
+  // Best-effort appetite scan (APOS #69): a top-level maxAttempts, or
+  // one on the item for this goal.
+  const topLevel = validMaxAttempts(parsed["maxAttempts"]);
+  if (topLevel !== undefined) return topLevel;
+  for (const item of parsed["items"]) {
+    if (isRecord(item) && item["goalId"] === goalId) {
+      const found = validMaxAttempts(item["maxAttempts"]);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
 }
 
 /** Parse `plan --json`: the goal's status when the plan lists it. */
-function parsePlan(stdout: string, goalId: string): GoalStatus | undefined {
+function parsePlan(
+  stdout: string,
+  goalId: string,
+): { status: GoalStatus | undefined; maxAttempts: number | undefined } {
   const parsed = parseJson("plan", stdout);
   if (!isRecord(parsed) || !Array.isArray(parsed["goals"])) {
     throw new Error("plan: unexpected JSON shape (expected an object with a goals array)");
@@ -168,10 +208,10 @@ function parsePlan(stdout: string, goalId: string): GoalStatus | undefined {
       if (!isGoalStatus(goal["status"])) {
         throw new Error(`plan: unknown status "${goal["status"]}" for ${goalId}`);
       }
-      return goal["status"];
+      return { status: goal["status"], maxAttempts: validMaxAttempts(goal["maxAttempts"]) };
     }
   }
-  return undefined;
+  return { status: undefined, maxAttempts: undefined };
 }
 
 interface GoalListRow {
@@ -197,6 +237,8 @@ interface GoalShow {
   status: GoalStatus;
   hasSetup: boolean;
   testsLocked: boolean;
+  /** Best-effort appetite from the text output (APOS #69), if present. */
+  maxAttempts: number | undefined;
 }
 
 /** Parse `goal show <goalId>` (text): status, setup and test lock. */
@@ -223,12 +265,14 @@ function parseGoalShow(stdout: string, goalId: string): GoalShow {
       testsLocked = value !== "" && value !== "không có";
     }
   }
-  return { status: statusField, hasSetup, testsLocked };
+  return { status: statusField, hasSetup, testsLocked, maxAttempts: scanTextForAppetite(stdout) };
 }
 
 interface Metrics {
   attemptsUsed: number;
   packageStatus: PackageStatus;
+  /** Best-effort appetite from the JSON output (APOS #69), if present. */
+  maxAttempts: number | undefined;
 }
 
 /** Parse `metrics show <goalId>` (JSON by default): submits and red gates. */
@@ -257,7 +301,7 @@ function parseMetrics(stdout: string, goalId: string): Metrics {
   }
   const packageStatus: PackageStatus =
     attemptsUsed === 0 ? "none" : redGates === attemptsUsed ? "red" : "pending";
-  return { attemptsUsed, packageStatus };
+  return { attemptsUsed, packageStatus, maxAttempts: validMaxAttempts(parsed["maxAttempts"]) };
 }
 
 /**
@@ -270,7 +314,9 @@ function parseMetrics(stdout: string, goalId: string): Metrics {
  *
  * `options.attemptsMax` overrides the default maximum attempts (3); see
  * `ReadGoalStateOptions`. The returned `attemptsMax` is always at least
- * `attemptsUsed`.
+ * `attemptsUsed`. `attemptsMaxSource` says where the value came from:
+ * "cli" when a CLI output exposed a valid `maxAttempts` (APOS #69), else
+ * "default" — including when `options.attemptsMax` overrode it.
  */
 export async function readGoalState(
   projectPath: string,
@@ -288,13 +334,13 @@ export async function readGoalState(
   const run = executor ?? defaultExecutor(projectPath);
 
   const inboxOut = await runRead(run, "inbox", ["inbox", "--json"]);
-  parseInbox(inboxOut);
+  const inboxAppetite = parseInbox(inboxOut, goalId);
 
   const planOut = await runRead(run, "plan", ["plan", "--json"]);
   // The plan is validated (JSON shape, goal listed when present), but the
   // status below comes from `goal show`, the most detailed source; `goal
   // list` and `plan` agree with it in the recorded output.
-  parsePlan(planOut, goalId);
+  const plan = parsePlan(planOut, goalId);
 
   const goalListOut = await runRead(run, "goal list", ["goal", "list"]);
   // Rejects when the goal is missing from the list.
@@ -310,7 +356,18 @@ export async function readGoalState(
   // `goal list` by the parsers above, which reject a missing goal).
   const status = goalShow.status;
 
-  const attemptsMax = Math.max(attemptsMaxOption ?? DEFAULT_ATTEMPTS_MAX, metrics.attemptsUsed);
+  // Appetite: an explicit option wins; else the first valid value the
+  // CLI exposed (metrics, plan, inbox, goal show — in that order);
+  // else the default 3. A valid CLI value below attemptsUsed is clamped
+  // to attemptsUsed but still counts as "cli" (it was exposed).
+  const cliAppetite =
+    metrics.maxAttempts ?? plan.maxAttempts ?? inboxAppetite ?? goalShow.maxAttempts;
+  const attemptsMaxSource: "cli" | "default" =
+    attemptsMaxOption === undefined && cliAppetite !== undefined ? "cli" : "default";
+  const attemptsMax = Math.max(
+    attemptsMaxOption ?? cliAppetite ?? DEFAULT_ATTEMPTS_MAX,
+    metrics.attemptsUsed,
+  );
 
   return {
     goalId,
@@ -319,6 +376,7 @@ export async function readGoalState(
     testsLocked: goalShow.testsLocked,
     attemptsUsed: metrics.attemptsUsed,
     attemptsMax,
+    attemptsMaxSource,
     packageStatus: metrics.packageStatus,
   };
 }

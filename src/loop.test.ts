@@ -48,9 +48,15 @@ describe("AC-5: dry run on a sample project gives the Solo step sequence", () =>
     expect(scenario(result, "without-setup").humanGatedAttempted).toBe(false);
   });
 
-  it("AC-5: dry run covers the with-setup, without-setup and red-gate scenarios", () => {
+  it("AC-5: dry run covers the with-setup, without-setup, red-gate and code-ready scenarios", () => {
     const result = runDryRun();
+    // GOAL-002 AC-5 (approved criterion) adds the "code-ready" scenario
+    // to the dry run; the old exact list of three names contradicted
+    // that criterion, so the criterion wins and this list is updated
+    // (see _core/execute.md §1: a test contradicting an approved
+    // acceptance criterion is updated and the reason cited).
     expect(result.scenarios.map((s) => s.name).sort()).toEqual([
+      "code-ready",
       "red-gate",
       "with-setup",
       "without-setup",

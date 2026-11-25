@@ -24,6 +24,22 @@ export interface GoalState {
   attemptsUsed: number;
   attemptsMax: number;
   packageStatus: PackageStatus;
+  /**
+   * Code-ready signal (GOAL-002, R-1): true only when the loop has
+   * ALREADY verified the handover commit — it exists in the repo, is a
+   * descendant of the plan's baseCommit, is not baseCommit itself, and
+   * was never submitted. The pure machine trusts this flag and never
+   * runs git itself. Absent (older callers) means "not verified".
+   */
+  codeReady?: boolean;
+  /** Commit SHA the Worker handed over, or null when nothing was handed over. */
+  handoverCommit?: string | null;
+  /** Commits already submitted (loop-level record); never submit again. */
+  submittedCommits?: readonly string[];
+  /** Commits that went red at the gate (loop-level record); never submit again. */
+  redCommits?: readonly string[];
+  /** Where attemptsMax came from: the CLI ("cli") or the default ("default"). */
+  attemptsMaxSource?: "cli" | "default";
 }
 
 export type StepAction =
@@ -43,6 +59,14 @@ export interface Step {
   action: StepAction;
   reason: string;
   humanGate: boolean;
+  /**
+   * The handover commit a package-submit step carries (GOAL-002): the
+   * verified Worker commit to submit. Absent on every other step — in
+   * particular a step never carries a commit that was already submitted
+   * or went red, and a pending package no longer carries the handover
+   * (it was consumed by the submit).
+   */
+  handoverCommit?: string;
 }
 
 /**
@@ -66,8 +90,15 @@ export const HUMAN_GATED_COMMANDS: readonly string[] = [
   "hotfix",
 ];
 
-function step(action: StepAction, reason: string, humanGate: boolean): Step {
-  return { action, reason, humanGate };
+function step(
+  action: StepAction,
+  reason: string,
+  humanGate: boolean,
+  handoverCommit?: string,
+): Step {
+  return handoverCommit === undefined
+    ? { action, reason, humanGate }
+    : { action, reason, humanGate, handoverCommit };
 }
 
 /**
@@ -161,8 +192,49 @@ export function nextStep(state: GoalState): Step {
       break;
   }
 
-  // Executing, no package submitted yet: tests first when a setup is
-  // pinned and the tests are not locked, otherwise the Worker writes code.
+  // Executing, no package submitted yet: a verified code-ready handover
+  // goes straight to package-submit with that commit — this is the fix
+  // for the GOAL-002 loop stall (before, package-submit was only
+  // reachable from a pending package, which only exists after a submit).
+  // The handover is trusted only when the loop verified it
+  // (codeReady); an unverified handover is "no code" and the reason
+  // names the commit as the warning channel. A commit that was already
+  // submitted or went red is never submitted again. Code-ready beats
+  // the tests-submit branch: code exists, so tests were already
+  // submitted.
+  const handover = state.handoverCommit ?? null;
+  const submitted = state.submittedCommits ?? [];
+  const red = state.redCommits ?? [];
+  if (
+    state.codeReady === true &&
+    handover !== null &&
+    !submitted.includes(handover) &&
+    !red.includes(handover)
+  ) {
+    return step(
+      "package-submit",
+      `Worker handed over commit ${handover}; the code is ready, so the Lead submits that commit for the gate check.`,
+      false,
+      handover,
+    );
+  }
+  if (handover !== null && state.codeReady !== true) {
+    return step(
+      "worker-write-code",
+      `Handover commit ${handover} is not verified (code-ready not confirmed), so it is treated as no code; the Worker writes the code.`,
+      false,
+    );
+  }
+  if (handover !== null && (submitted.includes(handover) || red.includes(handover))) {
+    return step(
+      "worker-write-code",
+      `Handover commit ${handover} was already submitted or went red, so it is never submitted again; the Worker writes new code.`,
+      false,
+    );
+  }
+  // Executing, no package submitted yet and no usable handover: tests
+  // first when a setup is pinned and the tests are not locked,
+  // otherwise the Worker writes code.
   if (state.hasSetup && !state.testsLocked) {
     return step(
       "tests-submit",

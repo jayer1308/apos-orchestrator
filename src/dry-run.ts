@@ -30,6 +30,13 @@ const EXPECTED_SEQUENCES: Record<DryRunScenarioName, readonly string[]> = {
     "package-submit",
     "report-human-blocked",
   ],
+  "code-ready": [
+    "lead-propose",
+    "lead-commit",
+    "worker-write-code",
+    "package-submit",
+    "wait-human-close",
+  ],
 };
 
 /** Run the dry run and print its step sequence. Throws on any failure. */
