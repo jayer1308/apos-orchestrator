@@ -66,6 +66,13 @@ describe("AC-1: state machine returns the next Solo step for every Goal state", 
     expect(step.reason.trim().length).toBeGreaterThan(0);
   });
 
+  it("AC-1: testing goal goes to tests-submit (Lead decision: testing is the Tester writing tests)", () => {
+    const step = nextStep(state({ status: "testing", hasSetup: true, testsLocked: false }));
+    expect(step.action).toBe("tests-submit");
+    expect(step.humanGate).toBe(false);
+    expect(step.reason.trim().length).toBeGreaterThan(0);
+  });
+
   it("AC-1: executing with setup and unlocked tests goes to tests-submit", () => {
     const step = nextStep(
       state({ status: "executing", hasSetup: true, testsLocked: false, packageStatus: "none" }),
