@@ -1,6 +1,6 @@
 # GOAL-003 v1: Runner tự lái trọn một Goal: chế độ drive giữ handover, tự chuyển sang package-submit với commit đã verify, xử lý được đường đỏ — chứng minh bằng live-test chỉ dùng runner.
 
-Status: verified
+Status: closed
 
 ```json
 {
