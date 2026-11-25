@@ -29,10 +29,11 @@
 // (`node dist/live-test.js`).
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveAposCli } from "./apos-cli.js";
 import {
   applyHandover,
   consumeHandover,
@@ -154,23 +155,12 @@ function sampleExecutionJson(baseCommit: string, briefSha256: string): string {
   });
 }
 
-/** Resolve the APOS CLI the same way the state reader does (see src/state-reader.ts). */
-function resolveAposCli(): string {
-  const fromEnv = process.env["APOS_CLI"];
-  if (fromEnv !== undefined && fromEnv !== "") {
-    return fromEnv;
-  }
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sibling = resolve(here, "..", "..", "apos", "dist", "cli.js");
-  if (existsSync(sibling)) {
-    return sibling;
-  }
-  throw new Error(
-    "Could not find the APOS CLI: set APOS_CLI to the CLI entry point " +
-      "(e.g. ~/workspace/apos/dist/cli.js) or keep the APOS repo as a " +
-      "sibling of this repo so ../apos/dist/cli.js exists.",
-  );
-}
+// The APOS CLI itself is an environment prerequisite (like git and
+// node), resolved by the shared src/apos-cli.ts: $APOS_CLI, then the
+// sibling ../apos/dist/cli.js, then $HOME/workspace/apos/dist/cli.js,
+// then `apos` on PATH. A fresh gate worktree (APOS #70) has no sibling
+// APOS repo, so the $HOME fallback is what finds the CLI there; set
+// APOS_CLI to point elsewhere when the CLI lives at another path.
 
 interface RunOutput {
   stdout: string;

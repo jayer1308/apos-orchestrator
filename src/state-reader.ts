@@ -33,10 +33,8 @@
 //   value returned is always at least `attemptsUsed`.
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { GoalState, GoalStatus, PackageStatus } from "./state-machine.js";
+import { resolveAposCli } from "./apos-cli.js";
 
 /** One APOS CLI invocation: its stdout, stderr and exit code. */
 export interface CliResult {
@@ -82,33 +80,9 @@ function isGoalStatus(value: string): value is GoalStatus {
   return GOAL_STATUSES.includes(value);
 }
 
-/**
- * Resolve the APOS CLI entry point for the default executor. `APOS_CLI`
- * wins when set; otherwise the sibling layout on this machine is tried:
- * `../apos/dist/cli.js` relative to this repo (the orchestrator repo and
- * the APOS repo sit side by side under the same parent directory). The
- * module lives in `<repo>/src` under vitest and in `<repo>/dist` once
- * built, so two levels up from this file is the parent of the repo root
- * in both cases.
- */
-function resolveAposCli(): string {
-  const fromEnv = process.env["APOS_CLI"];
-  if (fromEnv !== undefined && fromEnv !== "") {
-    return fromEnv;
-  }
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sibling = resolve(here, "..", "..", "apos", "dist", "cli.js");
-  if (existsSync(sibling)) {
-    return sibling;
-  }
-  throw new Error(
-    "Could not find the APOS CLI: set APOS_CLI to the CLI entry point " +
-      "(e.g. ~/workspace/apos/dist/cli.js) or keep the APOS repo as a " +
-      "sibling of this repo so ../apos/dist/cli.js exists.",
-  );
-}
-
-/** Default executor: runs `node <cli> --repo <projectPath> <args>`. */
+/** Default executor: runs `node <cli> --repo <projectPath> <args>`. The
+ * CLI is resolved by the shared src/apos-cli.ts ($APOS_CLI, sibling,
+ * $HOME/workspace/apos/dist/cli.js, `apos` on PATH). */
 function defaultExecutor(projectPath: string): CliExecutor {
   const cli = resolveAposCli();
   return (args) =>

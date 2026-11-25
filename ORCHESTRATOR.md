@@ -210,9 +210,19 @@ Khi không inject executor (test inject executor giả), reader mặc định ch
 2. Nếu không có, thử đường dẫn sibling `../apos/dist/cli.js` tương đối từ
    repo này — repo orchestrator và repo APOS nằm cạnh nhau dưới cùng một
    thư mục cha trên máy này.
+3. Nếu không có, thử `$HOME/workspace/apos/dist/cli.js` — đây là đường
+   tìm được CLI trong worktree mới của gate, nơi không có repo APOS
+   sibling (mỗi check của gate chạy trong một worktree mới riêng, xem
+   APOS #70).
+4. Nếu vẫn không có, tìm lệnh `apos` thực thi được trên PATH mà chạy
+   được dưới `node` (file `.js` hoặc script có shebang node); một shell
+   wrapper không chạy được dưới `node` sẽ bị bỏ qua.
 
-Nếu cả hai đều không có, `readGoalState` reject với lỗi nói rõ cách trỏ
-tới CLI.
+Nếu tất cả đều không có, `readGoalState` (và live test) reject với lỗi
+liệt kê mọi đường đã thử. APOS CLI là prerequisite của môi trường như
+git và node — nó không đi kèm repo này; đặt `APOS_CLI` khi CLI nằm ở
+đường khác. Thứ tự resolve này dùng chung cho reader và live test
+(`src/apos-cli.ts`).
 
 ## Dry run
 
