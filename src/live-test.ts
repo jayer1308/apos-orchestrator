@@ -15,6 +15,23 @@
 //       gate đỏ → Worker fix commit mới → drive --handover <sha mới> →
 //       package-submit → verified.
 //
+// Multi-WP (GOAL-004 AC-4, CHK-4): the same driver also runs two
+// further scenarios on a real 2-package Goal (WP-A / WP-B, independent
+// files, `package add` through the CLI), driven ONLY through the
+// subprocess drive runner with per-package handovers
+// (`--drive --handover WP-A:<sha> --handover WP-B:<sha>`):
+//   (c) `multi-wp-green-first`: both packages green on the first submit.
+//   (d) `multi-wp-red-then-green`: WP-A red once, then fixed and green.
+// The two packages are developed on separate branches from the plan
+// base (so each submit's diff stays inside its own package paths) and
+// the integration commit is a merge commit (no squash/rebase) with both
+// green package commits as ancestors; on `integration-gate` the driver
+// builds that merge commit, runs `apos integration gate` on it and,
+// when it is green, `apos integration complete` in the same step (the
+// reader cannot report the gate outcome — see src/state-reader.ts — so
+// gate + complete are the two halves of executing that one printed
+// step), and the Goal verifies.
+//
 // Self-contained on purpose: each gate check runs in a fresh worktree
 // (APOS #70), so this entry must not depend on any repo outside the temp
 // dir it builds — only the APOS CLI (resolved like the state reader
@@ -60,6 +77,8 @@ import { resolveAposCli } from "./apos-cli.js";
 
 export const LIVE_GOAL_ID = "GOAL-001";
 export const LIVE_PACKAGE_ID = "WP-MAIN";
+/** The sample Multi-WP packages (GOAL-004 AC-4): two independent packages. */
+export const LIVE_MULTI_WP_PACKAGE_IDS = ["WP-A", "WP-B"];
 
 /** The orchestrator repo root (this module lives in src/ or dist/). */
 const ORCHESTRATOR_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -80,6 +99,8 @@ export interface LiveTestResult {
   verified: boolean;
   log: string;
   scenarios: LiveScenarioResult[];
+  /** The Multi-WP scenarios (GOAL-004 AC-4), in order. */
+  multiWpScenarios: LiveScenarioResult[];
 }
 
 const SAMPLE_PACKAGE_JSON = `{
@@ -184,6 +205,171 @@ function sampleExecutionJson(baseCommit: string, briefSha256: string): string {
     risks: [],
     acceptanceMapping: [{ acceptanceId: "AC-1", verification: "npm test" }],
     verificationStrategy: "Run npm test",
+  });
+}
+
+// --- Multi-WP sample (GOAL-004 AC-4) -------------------------------------
+// Two independent packages: WP-A owns greet-a (CHK-1), WP-B owns
+// greet-b (CHK-2). Each package's gate runs only its own check, so a
+// wrong WP-A commit goes red without failing WP-B's gate, and each
+// package's submit diff stays inside its own paths because the two
+// Worker commits live on separate branches from the plan base.
+
+const SAMPLE_MULTI_PACKAGE_JSON = `{
+  "name": "live-sample-multi",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "test": "node test-a.mjs && node test-b.mjs"
+  }
+}
+`;
+
+const SAMPLE_GREET_A_BASE = `export function greetA() {
+  return "hello";
+}
+`;
+
+const SAMPLE_GREET_A_FIXED = `export function greetA() {
+  return "xin chào";
+}
+`;
+
+const SAMPLE_GREET_A_WRONG = `export function greetA() {
+  return "hello";
+}
+// worker: first attempt
+`;
+
+const SAMPLE_GREET_B_BASE = `export function greetB() {
+  return "hello";
+}
+`;
+
+const SAMPLE_GREET_B_FIXED = `export function greetB() {
+  return "chào bạn";
+}
+`;
+
+const SAMPLE_GREET_B_WRONG = `export function greetB() {
+  return "hello";
+}
+// worker: first attempt
+`;
+
+const SAMPLE_TEST_A = `import assert from "node:assert";
+import { greetA } from "./greet-a.mjs";
+
+assert.equal(greetA(), "xin chào");
+console.log("test-a ok");
+`;
+
+const SAMPLE_TEST_B = `import assert from "node:assert";
+import { greetB } from "./greet-b.mjs";
+
+assert.equal(greetB(), "chào bạn");
+console.log("test-b ok");
+`;
+
+const SAMPLE_MULTI_BRIEF = `# Brief mẫu Multi-WP: greetA trả "xin chào", greetB trả "chào bạn"
+
+Dòng 8: hàm greetA() phải trả về "xin chào".
+Dòng 9: hàm greetB() phải trả về "chào bạn".
+Dòng 10: test-a.mjs kiểm chứng greetA, test-b.mjs kiểm chứng greetB.
+`;
+
+function sampleMultiGoalJson(): string {
+  return JSON.stringify({
+    id: LIVE_GOAL_ID,
+    version: 1,
+    outcome: 'greetA() trả về xin chào, greetB() trả về chào bạn',
+    requirements: [
+      { id: "R-1", sourceSpan: "dòng 8", text: 'hàm greetA() phải trả về xin chào', disposition: "acceptance" },
+      { id: "R-2", sourceSpan: "dòng 9", text: 'hàm greetB() phải trả về chào bạn', disposition: "acceptance" },
+    ],
+    scope: ["greet-a.mjs", "test-a.mjs", "greet-b.mjs", "test-b.mjs"],
+    exclusions: [],
+    dependencies: [],
+    priority: 1,
+    acceptance: [
+      {
+        id: "AC-1",
+        text: 'greetA() trả về xin chào',
+        requirementIds: ["R-1"],
+        examples: [{ input: "greetA()", expected: "xin chào" }],
+        boundaries: [],
+        prohibited: [],
+        checkIds: ["CHK-1"],
+      },
+      {
+        id: "AC-2",
+        text: 'greetB() trả về chào bạn',
+        requirementIds: ["R-2"],
+        examples: [{ input: "greetB()", expected: "chào bạn" }],
+        boundaries: [],
+        prohibited: [],
+        checkIds: ["CHK-2"],
+      },
+    ],
+    checks: [
+      { id: "CHK-1", kind: "command", command: "node test-a.mjs", expect: "pass", runs: 1, timeoutMs: 600000, env: {} },
+      { id: "CHK-2", kind: "command", command: "node test-b.mjs", expect: "pass", runs: 1, timeoutMs: 600000, env: {} },
+    ],
+  });
+}
+
+function sampleMultiExecutionJson(baseCommit: string, briefSha256: string): string {
+  return JSON.stringify({
+    id: "EXEC-1",
+    version: 1,
+    goalId: LIVE_GOAL_ID,
+    goalVersion: 1,
+    mode: "multi-wp",
+    approach:
+      "WP-A đổi greetA() trả về xin chào, WP-B đổi greetB() trả về chào bạn, mỗi package trên một branch riêng; hợp nhất bằng merge commit rồi integration gate.",
+    baseCommit,
+    sourceSha256: briefSha256,
+    estimatedCost: { wallMinutes: 60 },
+    rationale: "Hai thay đổi độc lập, không phụ thuộc nhau.",
+    splitRationale: "Hai hàm độc lập trên hai file độc lập: tách thành hai package song song để mỗi package green riêng rồi mới hợp nhất ở integration gate.",
+    sharedPaths: [],
+    paths: ["greet-a.mjs", "test-a.mjs", "greet-b.mjs", "test-b.mjs"],
+    stubPaths: [],
+    entries: ["greet-a.mjs:greetA", "greet-b.mjs:greetB"],
+    risks: [],
+    acceptanceMapping: [
+      { acceptanceId: "AC-1", verification: "node test-a.mjs" },
+      { acceptanceId: "AC-2", verification: "node test-b.mjs" },
+    ],
+    verificationStrategy: "Run node test-a.mjs and node test-b.mjs per package, then the integration gate on the merge commit",
+  });
+}
+
+function sampleMultiPackageJson(packageId: "WP-A" | "WP-B"): string {
+  const isA = packageId === "WP-A";
+  return JSON.stringify({
+    id: packageId,
+    goalId: LIVE_GOAL_ID,
+    goalVersion: 1,
+    version: 1,
+    owner: "lead",
+    outcome: isA ? 'greetA() trả về xin chào' : 'greetB() trả về chào bạn',
+    scope: isA ? ["greet-a.mjs", "test-a.mjs"] : ["greet-b.mjs", "test-b.mjs"],
+    exclusions: [],
+    dependencies: [],
+    interfaces: isA ? ["greetA@v1"] : ["greetB@v1"],
+    acceptance: [
+      {
+        id: isA ? "AC-1" : "AC-2",
+        text: isA ? 'greetA() trả về xin chào' : 'greetB() trả về chào bạn',
+        goalAcceptanceId: isA ? "AC-1" : "AC-2",
+        checkIds: isA ? ["CHK-1"] : ["CHK-2"],
+      },
+    ],
+    integration: "hợp nhất ở integration gate bằng merge commit chứa commit green của cả hai package",
+    paths: isA ? ["greet-a.mjs", "test-a.mjs"] : ["greet-b.mjs", "test-b.mjs"],
+    stubPaths: [],
   });
 }
 
@@ -383,24 +569,27 @@ async function ensureRunnerBuilt(log: (line: string) => void): Promise<void> {
 
 interface DriveStep {
   action: string;
+  packageId?: string | undefined;
   handoverCommit?: string | undefined;
   status?: string | undefined;
 }
 
 /**
  * One drive-runner invocation: `node dist/index.js --repo <projectDir>
- * --goal <id> --drive [--handover <sha>]`. The runner only prints the
- * next step; this test executes it. Returns the printed step action,
- * the handover commit it carries (if any) and the printed Goal status.
+ * --goal <id> --drive [--handover <value> ...]` (one bare SHA for Solo,
+ * one `<pkg>:<sha>` per package for Multi-WP). The runner only prints
+ * the next step; this test executes it. Returns the printed step action,
+ * its package (when the runner prints one), the handover commit it
+ * carries (if any) and the printed Goal status.
  */
 async function drive(
   projectDir: string,
   scenario: string,
-  handover: string | undefined,
+  handovers: readonly string[],
   log: (line: string) => void,
 ): Promise<DriveStep> {
   const args = ["--repo", projectDir, "--goal", LIVE_GOAL_ID, "--drive"];
-  if (handover !== undefined) {
+  for (const handover of handovers) {
     args.push("--handover", handover);
   }
   log(`live: drive ${scenario}: node dist/index.js ${args.join(" ")}`);
@@ -418,10 +607,12 @@ async function drive(
       `live: drive runner printed no next step for ${scenario}: ${out.stdout.slice(0, 1000)}`,
     );
   }
+  const packageMatch = /package: ([A-Z][A-Z0-9-]*)/.exec(out.stdout);
   const handoverMatch = /handover commit: ([0-9a-f]+)/.exec(out.stdout);
   const statusMatch = /\(status: ([a-z-]+)\)/.exec(out.stdout);
   return {
     action: stepMatch[1],
+    packageId: packageMatch?.[1],
     handoverCommit: handoverMatch?.[1],
     status: statusMatch?.[1],
   };
@@ -436,22 +627,23 @@ async function drive(
 async function submitPackage(
   cli: string,
   projectDir: string,
+  packageId: string,
   commit: string,
   log: (line: string) => void,
 ): Promise<string> {
   const out = await runCommand(
     "node",
-    [cli, "--repo", projectDir, "package", "submit", LIVE_GOAL_ID, LIVE_PACKAGE_ID, "--commit", commit, "--json"],
+    [cli, "--repo", projectDir, "package", "submit", LIVE_GOAL_ID, packageId, "--commit", commit, "--json"],
     projectDir,
   );
   const parsed = JSON.parse(out.stdout) as { result?: unknown; goalStatus?: unknown };
   const result = String(parsed.result ?? "?");
-  log(`live: package-submit ${commit} -> ${result} (exit ${out.exitCode})`);
+  log(`live: package-submit ${packageId} ${commit} -> ${result} (exit ${out.exitCode})`);
   if (out.exitCode === 0 && result === "green") {
     return "green";
   }
   if (result === "red") {
-    log(`live: gate red for ${commit}; the driver asks the runner again for the fix step`);
+    log(`live: gate red for ${packageId} ${commit}; the driver asks the runner again for the fix step`);
     return "red";
   }
   throw new Error(
@@ -516,7 +708,12 @@ async function runScenario(
   let pendingHandover: string | null = null;
   let verified = false;
   for (let iteration = 0; iteration < 20; iteration += 1) {
-    const step = await drive(projectDir, name, pendingHandover ?? undefined, log);
+    const step = await drive(
+      projectDir,
+      name,
+      pendingHandover !== null ? [pendingHandover] : [],
+      log,
+    );
     steps.push(step.action);
     log(`live: ${name}: ${step.status ?? "?"} -> ${step.action}`);
     if (step.action === "wait-human-approve") {
@@ -604,7 +801,7 @@ async function runScenario(
         log(`live: ${name}: package-submit carries no handover commit (already submitted); asking the runner again`);
         continue;
       }
-      await submitPackage(cli, projectDir, commit, log);
+      await submitPackage(cli, projectDir, LIVE_PACKAGE_ID, commit, log);
       pendingHandover = null;
       continue;
     }
@@ -630,6 +827,263 @@ async function runScenario(
     );
   }
   log(`live test: scenario ${name} ok — ${LIVE_GOAL_ID} verified via ${steps.join(" -> ")}`);
+  return { name, steps, verified, projectDir };
+}
+
+/**
+ * Build one sample Multi-WP APOS project and drive its real 2-package
+ * Goal from `selected` to verified ONLY through the drive runner, with
+ * per-package handovers (`--handover WP-A:<sha> --handover WP-B:<sha>`).
+ * `wrongFirst` makes WP-A's first Worker commit intentionally wrong
+ * (greetA returns "hello"), so its gate goes red once and the Worker
+ * must fix it; WP-B is always correct on the first attempt.
+ *
+ * Branching: each package is developed on its own branch from the plan
+ * base (`wp-a` / `wp-b`), so each submit's diff stays inside its own
+ * package paths. On `integration-gate` the driver merges `wp-b` into
+ * `wp-a` (a merge commit, never squash/rebase) and runs
+ * `integration gate` on it, then `integration complete` when it is
+ * green — the two halves of executing that one printed step.
+ */
+async function runMultiWpScenario(
+  name: string,
+  wrongFirst: boolean,
+  baseDir: string,
+  cli: string,
+  log: (line: string) => void,
+): Promise<LiveScenarioResult> {
+  const projectDir = join(baseDir, name, "sample");
+  mkdirSync(projectDir, { recursive: true });
+  const steps: string[] = [];
+  log(`live test: multi-wp scenario ${name} — projectDir=${projectDir}`);
+
+  // --- Build the sample project (base commit: red tests, code not yet fixed).
+  writeFileSync(join(projectDir, "package.json"), SAMPLE_MULTI_PACKAGE_JSON);
+  writeFileSync(join(projectDir, "greet-a.mjs"), SAMPLE_GREET_A_BASE);
+  writeFileSync(join(projectDir, "greet-b.mjs"), SAMPLE_GREET_B_BASE);
+  writeFileSync(join(projectDir, "test-a.mjs"), SAMPLE_TEST_A);
+  writeFileSync(join(projectDir, "test-b.mjs"), SAMPLE_TEST_B);
+  writeFileSync(join(projectDir, "brief.md"), SAMPLE_MULTI_BRIEF);
+  writeFileSync(join(projectDir, "goal.json"), sampleMultiGoalJson());
+  await runOrThrow("git init", "git", ["init", "-q"], projectDir);
+  await runOrThrow("git config", "git", ["config", "user.email", "live-test@example.com"], projectDir);
+  await runOrThrow("git config", "git", ["config", "user.name", "Live Test"], projectDir);
+  await runOrThrow("git add", "git", ["add", "-A"], projectDir);
+  await runOrThrow("git commit", "git", ["commit", "-qm", "base: multi-wp sample project"], projectDir);
+  const baseCommit = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
+  const briefSha256 = createHash("sha256").update(SAMPLE_MULTI_BRIEF).digest("hex");
+  log(`live test: multi-wp scenario ${name}: base commit ${baseCommit}`);
+  await runApos(cli, projectDir, ["init"]);
+  await runApos(cli, projectDir, ["goal", "create", "--file", "goal.json", "--source", "brief.md"]);
+  log(`live test: multi-wp scenario ${name}: created ${LIVE_GOAL_ID} (draft)`);
+
+  // --- Drive the real Goal ONLY through the subprocess drive runner.
+  const pendingHandovers = new Map<string, string>();
+  const greenCommits = new Map<string, string>();
+  let planBase: string | null = null;
+  let integrationCommit: string | null = null;
+  let verified = false;
+  for (let iteration = 0; iteration < 40; iteration += 1) {
+    const handovers = [...pendingHandovers.entries()].map(([pkg, sha]) => `${pkg}:${sha}`);
+    const step = await drive(projectDir, name, handovers, log);
+    steps.push(step.action);
+    log(`live: multi-wp ${name}: ${step.status ?? "?"} -> ${step.action}${step.packageId ? ` (${step.packageId})` : ""}`);
+    if (step.action === "wait-human-approve") {
+      const out = await runAposPty(
+        cli,
+        projectDir,
+        ["goal", "approve", LIVE_GOAL_ID, "--size", "S", "--max-minutes", "60", "--max-attempts", "3"],
+        LIVE_GOAL_ID,
+      );
+      if (out.exitCode !== 0) {
+        throw new Error(
+          `pty goal approve failed (exit ${out.exitCode}): ${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
+        );
+      }
+      log(`live: multi-wp ${name}: pty approved ${LIVE_GOAL_ID}`);
+      continue;
+    }
+    if (step.action === "wait-human-select") {
+      const out = await runAposPty(cli, projectDir, ["goal", "select", LIVE_GOAL_ID], LIVE_GOAL_ID);
+      if (out.exitCode !== 0) {
+        throw new Error(
+          `pty goal select failed (exit ${out.exitCode}): ${(out.stdout + out.stderr).trim().slice(0, 2000)}`,
+        );
+      }
+      log(`live: multi-wp ${name}: pty selected ${LIVE_GOAL_ID}`);
+      continue;
+    }
+    if (step.action === "lead-propose") {
+      // The plan starts from the current HEAD (see the Solo scenario:
+      // a baseCommit from before APOS's own auto-commits would make
+      // the delivery diff contain APOS-managed .apos files).
+      planBase = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
+      writeFileSync(
+        join(projectDir, "execution.json"),
+        sampleMultiExecutionJson(planBase, briefSha256),
+      );
+      log(`live: multi-wp ${name}: plan baseCommit ${planBase}`);
+      await runApos(cli, projectDir, ["lead", "propose", "--file", "execution.json"]);
+      steps.push("lead-commit");
+      log(`live: multi-wp ${name}: lead-propose done (execution.json proposed)`);
+      for (const packageId of LIVE_MULTI_WP_PACKAGE_IDS) {
+        const file = packageId === "WP-A" ? "package-a.json" : "package-b.json";
+        writeFileSync(join(projectDir, file), sampleMultiPackageJson(packageId as "WP-A" | "WP-B"));
+        await runApos(cli, projectDir, [
+          "package",
+          "add",
+          "--file",
+          file,
+          "--reason",
+          `package ${packageId} owns its greet function and check`,
+        ]);
+        log(`live: multi-wp ${name}: package add ${packageId} done`);
+      }
+      await runApos(cli, projectDir, ["lead", "commit", LIVE_GOAL_ID]);
+      log(`live: multi-wp ${name}: lead-commit done (plan accepted, Goal executing)`);
+      continue;
+    }
+    if (step.action === "worker-write-code" || step.action === "worker-fix") {
+      // The worker step for one package: apply the predetermined patch
+      // on that package's own branch from the plan base. The loop's job
+      // here is proving the transition, not an agent's reasoning. The
+      // commit SHA is handed to the next drive call as
+      // --handover <pkg>:<sha>; the runner verifies it with git.
+      const packageId = step.packageId;
+      if (packageId !== "WP-A" && packageId !== "WP-B") {
+        throw new Error(
+          `live: multi-wp ${name}: ${step.action} carries no package (got ${packageId ?? "none"}) — the driver cannot tell which package to write`,
+        );
+      }
+      if (planBase === null) {
+        throw new Error(`live: multi-wp ${name}: worker step before the plan base was recorded`);
+      }
+      const isA = packageId === "WP-A";
+      const branch = isA ? "wp-a" : "wp-b";
+      const file = isA ? "greet-a.mjs" : "greet-b.mjs";
+      let content: string;
+      let message: string;
+      if (step.action === "worker-fix") {
+        content = `${isA ? SAMPLE_GREET_A_FIXED : SAMPLE_GREET_B_FIXED}\n// fix: keep the greeting exact\n`;
+        message = `worker-fix: keep ${packageId} greeting exact`;
+      } else if (wrongFirst && isA) {
+        content = SAMPLE_GREET_A_WRONG;
+        message = "worker: WP-A first attempt (wrong greeting)";
+      } else {
+        content = isA ? SAMPLE_GREET_A_FIXED : SAMPLE_GREET_B_FIXED;
+        message = `worker: ${packageId} greet returns the right greeting`;
+      }
+      const branchExists = (await runCommand("git", ["show-ref", "--verify", `refs/heads/${branch}`], projectDir)).exitCode === 0;
+      if (branchExists) {
+        await runOrThrow("git checkout", "git", ["checkout", branch], projectDir);
+      } else {
+        await runOrThrow("git checkout", "git", ["checkout", "-b", branch, planBase], projectDir);
+      }
+      writeFileSync(join(projectDir, file), content);
+      await runOrThrow("git add", "git", ["add", "-A"], projectDir);
+      await runOrThrow("git commit", "git", ["commit", "-qm", message], projectDir);
+      const handover = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
+      pendingHandovers.set(packageId, handover);
+      log(`live: multi-wp ${name}: ${step.action} ${packageId} handed over ${handover} (next drive call passes it as --handover ${packageId}:${handover})`);
+      continue;
+    }
+    if (step.action === "package-submit") {
+      const packageId = step.packageId;
+      const commit = step.handoverCommit;
+      if (packageId === undefined || commit === undefined) {
+        // Already submitted and waiting on the gate outcome; ask the
+        // runner again (the iteration cap guards against looping here).
+        log(`live: multi-wp ${name}: package-submit carries no package/handover commit (already submitted); asking the runner again`);
+        continue;
+      }
+      const result = await submitPackage(cli, projectDir, packageId, commit, log);
+      pendingHandovers.delete(packageId);
+      if (result === "green") {
+        greenCommits.set(packageId, commit);
+      }
+      continue;
+    }
+    if (step.action === "integration-gate") {
+      // Build the integration commit: a merge commit (never
+      // squash/rebase) with both green package commits as ancestors.
+      if (greenCommits.size !== LIVE_MULTI_WP_PACKAGE_IDS.length) {
+        throw new Error(
+          `live: multi-wp ${name}: integration-gate with only ${greenCommits.size} green packages — the driver cannot build the integration commit`,
+        );
+      }
+      await runOrThrow("git checkout", "git", ["checkout", "wp-a"], projectDir);
+      await runOrThrow(
+        "git merge",
+        "git",
+        ["merge", "--no-ff", "wp-b", "-m", "integration: merge WP-A and WP-B"],
+        projectDir,
+      );
+      integrationCommit = (await runCommand("git", ["rev-parse", "HEAD"], projectDir)).stdout.trim();
+      // The merge commit must have both green commits as ancestors.
+      for (const commit of greenCommits.values()) {
+        const isAncestor = (await runCommand("git", ["merge-base", "--is-ancestor", commit, integrationCommit], projectDir)).exitCode === 0;
+        if (!isAncestor) {
+          throw new Error(`live: multi-wp ${name}: integration commit ${integrationCommit} does not contain green commit ${commit} as an ancestor`);
+        }
+      }
+      log(`live: multi-wp ${name}: integration commit ${integrationCommit} (merge of ${[...greenCommits.values()].join(", ")})`);
+      const gateOut = await runApos(cli, projectDir, [
+        "integration",
+        "gate",
+        LIVE_GOAL_ID,
+        "--commit",
+        integrationCommit,
+        "--reason",
+        "merge of the two green package commits",
+      ]);
+      const gateText = gateOut.stdout + gateOut.stderr;
+      log(`live: multi-wp ${name}: integration gate output: ${gateText.trim().slice(0, 1000)}`);
+      if (!/Integration gate green/.test(gateText)) {
+        throw new Error(`live: multi-wp ${name}: integration gate did not go green: ${gateText.trim().slice(0, 2000)}`);
+      }
+      // The gate went green, so the driver runs integration complete
+      // in the same step (see the header note: the reader cannot
+      // report the gate outcome).
+      const completeOut = await runApos(cli, projectDir, [
+        "integration",
+        "complete",
+        LIVE_GOAL_ID,
+        "--commit",
+        integrationCommit,
+      ]);
+      log(`live: multi-wp ${name}: integration complete output: ${(completeOut.stdout + completeOut.stderr).trim().slice(0, 1000)}`);
+      continue;
+    }
+    if (step.action === "integration-complete") {
+      if (integrationCommit === null) {
+        throw new Error(`live: multi-wp ${name}: integration-complete with no integration commit built yet`);
+      }
+      await runApos(cli, projectDir, ["integration", "complete", LIVE_GOAL_ID, "--commit", integrationCommit]);
+      log(`live: multi-wp ${name}: integration complete ${integrationCommit}`);
+      continue;
+    }
+    if (step.action === "wait-human-close") {
+      // Human gate: the loop stops here and does NOT close the Goal.
+      verified = step.status === "verified";
+      log(
+        `live: multi-wp ${name}: stopped at human gate wait-human-close (status ${step.status}); ` +
+          "the loop does not close the Goal.",
+      );
+      break;
+    }
+    if (step.action === "done") {
+      verified = step.status === "verified" || step.status === "closed";
+      break;
+    }
+    throw new Error(`live: multi-wp unexpected step ${step.action} in scenario ${name} — the driver cannot execute it`);
+  }
+  if (!verified) {
+    throw new Error(
+      `live test multi-wp scenario ${name} did not reach verified (steps: ${steps.join(" -> ")}); ` +
+        "see the log above for where it stopped",
+    );
+  }
+  log(`live test: multi-wp scenario ${name} ok — ${LIVE_GOAL_ID} verified via ${steps.join(" -> ")}`);
   return { name, steps, verified, projectDir };
 }
 
@@ -667,9 +1121,22 @@ export async function runLiveTest(options?: {
   for (const scenario of scenarios) {
     steps.push(...scenario.steps);
   }
-  const verified = scenarios.every((scenario) => scenario.verified);
+  // Multi-WP (GOAL-004 AC-4): the same two paths, on a real 2-package
+  // Goal, driven only by the subprocess drive runner with per-package
+  // handovers. These run after the Solo scenarios and are reported in
+  // `multiWpScenarios` (the Solo `scenarios` list keeps exactly
+  // ["green-first", "red-then-green"] for GOAL-003).
+  const multiWpScenarios: LiveScenarioResult[] = [];
+  multiWpScenarios.push(await runMultiWpScenario("multi-wp-green-first", false, baseDir, cli, log));
+  multiWpScenarios.push(await runMultiWpScenario("multi-wp-red-then-green", true, baseDir, cli, log));
+  for (const scenario of multiWpScenarios) {
+    steps.push(...scenario.steps);
+  }
+  const verified =
+    scenarios.every((scenario) => scenario.verified) &&
+    multiWpScenarios.every((scenario) => scenario.verified);
   const projectDir = scenarios[0]?.projectDir ?? join(baseDir, "green-first", "sample");
-  log(`live test: ok — ${LIVE_GOAL_ID} verified in both scenarios via drive runner`);
+  log(`live test: ok — ${LIVE_GOAL_ID} verified in both Solo scenarios and both multi-wp scenarios via drive runner`);
   return {
     goalId: LIVE_GOAL_ID,
     projectDir,
@@ -677,6 +1144,7 @@ export async function runLiveTest(options?: {
     verified,
     log: logLines.join("\n"),
     scenarios,
+    multiWpScenarios,
   };
 }
 

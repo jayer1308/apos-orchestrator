@@ -5,8 +5,9 @@ watch agent nào. Repo này là phần còn thiếu đó — một vòng lặp (
 chạy trên máy này, đọc trạng thái APOS, gọi đúng role agent cho bước tiếp
 theo, kiểm chứng bằng lệnh APOS, và chỉ dừng hỏi human ở các gate.
 
-Phạm vi: quy trình Solo, một work package. Không tự approve/close thay
-human, không Multi-WP, không chạy nền 24/7.
+Phạm vi: Solo (một work package) và Multi-WP (nhiều work package song
+song — xem mục "Multi-WP" bên dưới). Không tự approve/close thay human,
+không chạy nền 24/7.
 
 ## Vòng lặp (loop)
 
@@ -22,7 +23,8 @@ Mỗi vòng lặp làm ba việc, rồi lặp lại từ đầu:
 2. **Chọn bước tiếp theo** — `nextStep(state)` trong
    `src/state-machine.ts` là hàm thuần túy: cùng một trạng thái ở goal khác
    nhau cho cùng một bước tiếp theo. Bảng trạng thái → bước tiếp theo ở
-   mục dưới.
+   mục dưới. Với Multi-WP, `nextStepForPackage(state, packageId)` trả
+   bước tiếp theo đúng cho từng package (xem mục "Multi-WP").
 3. **Chạy bước đó rồi kiểm chứng** — vòng lặp gọi đúng role agent cho bước
    tiếp theo (đọc skill tương ứng trong `.apos/skills` của project đích:
    Lead propose/commit, Tester submit test, Worker viết/sửa code, Lead
@@ -168,6 +170,111 @@ qua, không tạo file trạng thái).
   `wait-human-close`, `report-human-blocked`): chỉ in và dừng, không
   chạy lệnh human-gated nào và không dùng `--on-behalf`.
 
+### Multi-WP (GOAL-004)
+
+Một Goal có nhiều work package song song (ví dụ WP-A và WP-B trong cùng
+một Goal): vòng lặp theo dõi trạng thái **theo từng package** — package
+nào đã code-ready, package nào đang đỏ, package nào đã green — và trả
+bước tiếp theo đúng cho từng package. Một package đỏ không chặn package
+khác submit; trạng thái các package tách riêng, không lẫn nhau. Trường
+hợp một package (Solo) vẫn chạy đúng như hiện tại (`nextStep` cũ, không
+đổi behaviour).
+
+**Bảng trạng thái theo từng package** — khớp với `nextStepForPackage`
+trong `src/state-machine.ts` (đã có test ghim từng dòng). Ví dụ hai
+package WP-A và WP-B:
+
+| Trạng thái theo từng package | Bước tiếp theo | Dừng ở human gate? |
+|---|---|---|
+| executing, WP-A code-ready (handover đã kiểm chứng), WP-B red | package-submit cho WP-A, worker-fix cho WP-B | không — mỗi package đi bước của riêng nó |
+| executing, một package green, một package chưa xong | bước của package chưa xong (không phải integration-gate, không phải wait-human-close) | không |
+| executing, mọi package green | integration-gate | không — driver chạy lệnh `integration gate` |
+| executing, mọi package green, integration gate đã green | integration-complete | không — driver chạy lệnh `integration complete` |
+| verified (sau integration complete) | wait-human-close | có — chờ human close |
+
+Luật chi tiết (`nextStepForPackage(state, packageId)`):
+
+- Trạng thái Goal không phải `executing` thắng trước các package
+  (verified vẫn `wait-human-close`, draft vẫn `wait-human-approve`...),
+  đúng như `nextStep`.
+- Solo (không có map `packages`, hoặc chỉ một package) trả đúng đáp án
+  của `nextStep` cho cùng trạng thái.
+- Mỗi package áp dụng đúng luật Solo nhưng scoped theo package đó:
+  pending thì `package-submit` (không mang handover commit);
+  red + còn lượt thử + handover mới đã kiểm chứng thì `package-submit`
+  với đúng commit mới đó, red + còn lượt thử + không có handover mới
+  thì `worker-fix`; red + hết lượt thử thì `report-human-blocked`;
+  needs-human thì `report-human-blocked`; chưa có package + code-ready
+  đã kiểm chứng thì `package-submit` với đúng commit handover đó.
+- Một handover chỉ được submit khi nó không nằm trong danh sách đã
+  submit / đã đỏ của **bất kỳ** package nào (hợp của mọi package):
+  commit đã đỏ cho WP-A không bao giờ được submit lại cho WP-B.
+- Package đã green trong khi package khác chưa xong không có bước của
+  riêng nó: machine trả bước của package chưa xong, không trả
+  `integration-gate` và không trả `wait-human-close`.
+
+**Integration gate** — khi mọi package đã green riêng lẻ thì có một bước
+kiểm tra hợp nhất trước khi Goal được đóng; vòng lặp **lái lệnh APOS**,
+không tự làm gate riêng:
+
+1. Driver build một integration commit là commit merge (không
+   squash/rebase) chứa commit green của mọi package làm ancestor.
+2. Driver chạy `apos integration gate <goalId> --commit <sha> --reason <text>`
+   (lệnh `integration gate` của APOS).
+3. Khi gate green, driver chạy `apos integration complete <goalId>
+   --commit <sha> [--conflict-resolution <text>]` (lệnh
+   `integration complete` của APOS) — Goal verified.
+4. Chỉ sau đó Goal mới tới `wait-human-close`.
+
+Lưu ý về `integrationStatus`: reader luôn báo `"none"` — không có lệnh
+đọc nào của APOS lộ kết quả integration gate (`integration prepare` chỉ
+chứng minh mọi package green và liệt kê commit green / conflict; `goal
+show` và `metrics show` không có kết quả gate), nên reader không đoán
+và không sửa tay state APOS. Driver chạy `integration gate` biết nó
+green nên chạy `integration complete` ngay trong cùng bước
+`integration-gate` đã in; bước `integration-complete` của machine
+(`integrationStatus: "gate-green"`) được test bằng vitest. Đây là một
+APOS finding (xem mục "State reader" — cần một lệnh đọc như
+`integration status`).
+
+**Drive nhiều package** — `npm run live -- --repo <project> --goal <id>
+--drive [--handover <pkg>:<sha> ...]`:
+
+- **Nhận handover theo từng package** — `--handover <pkg>:<sha>` lặp
+  lại được, một handover cho mỗi package
+  (ví dụ `--handover WP-A:<sha> --handover WP-B:<sha>`); dạng trơn
+  `--handover <sha>` vẫn được chấp nhận và hiểu là package duy nhất
+  (Solo, tương thích cũ). Runner kiểm chứng từng handover bằng git cho
+  đúng package của nó (tồn tại, là hậu duệ của `baseCommit`, khác
+  `baseCommit`, chưa từng submit/chưa từng đỏ ở bất kỳ package nào);
+  handover của package này không bao giờ dùng cho package khác.
+  Runner trả `package-submit` cho package đầu tiên có handover đã kiểm
+  chứng (theo thứ tự `--handover`), với đúng commit của package đó.
+- **Giữ drive-state theo từng package** — file trạng thái vẫn là một
+  file cho mỗi project + goal (đường dẫn không đổi, xem
+  `src/drive-state.ts`), nhưng nội dung tách theo từng package:
+  `packages` map từng package id tới handover / code-ready / submitted /
+  red của riêng nó; hai danh sách `submittedCommits` / `redCommits` ở
+  cấp cao nhất là **hợp** của các package, để luật "không submit lại
+  commit đã đỏ của bất kỳ package nào" kiểm tra trên hợp đó.
+  `loadDriveState` / `saveDriveState` chuẩn hoá hợp này, nên state lưu
+  chỉ với map theo package vẫn load ra hợp đúng; state phẳng cũ không
+  có map `packages` vẫn load y nguyên.
+- **Đối chiếu (reconcile) theo từng package** — như Solo nhưng cho từng
+  package: handover đã in `package-submit` cho WP-A được tiêu thụ khi
+  reader thấy WP-A `pending`/`red`/`green`, và ghi đỏ khi WP-A `red`.
+- **Integration** — khi mọi package green, runner in `integration-gate`
+  (xem trên); driver build merge commit, chạy `integration gate`, rồi
+  `integration complete` khi green.
+
+**Live test Multi-WP** — `npm run test:live` tự dựng thêm một project
+mẫu có Goal thật 2 package (WP-A / WP-B, file độc lập, `package add`
+qua CLI) và lái trọn Goal chỉ bằng runner drive, cả hai đường
+green ngay lần nộp đầu (`multi-wp-green-first`) và đỏ một lần rồi
+green sau fix ở WP-A (`multi-wp-red-then-green`); hai package phát
+triển trên hai branch riêng từ plan base, integration commit là merge
+commit chứa commit green của cả hai package.
+
 ### Gate đỏ và số lần thử
 
 Khi `package submit` trả về exit 1 (gate đỏ), vòng lặp quay lại bước
@@ -221,7 +328,7 @@ human-gated. Vòng lặp cũng không bao giờ dùng `--on-behalf` khi human ch
 
 ## State reader
 
-`readGoalState(projectPath, goalId, executor?, options?)` chỉ gọi 5 lệnh
+`readGoalState(projectPath, goalId, executor?, options?)` chỉ gọi 6 lệnh
 đọc sau, không bao giờ gọi lệnh human-gated:
 
 | Lệnh | Định dạng output |
@@ -231,6 +338,7 @@ human-gated. Vòng lặp cũng không bao giờ dùng `--on-behalf` khi human ch
 | `goal list` | text — không có cờ `--json` |
 | `goal show <goalId>` | text — không có cờ `--json` |
 | `metrics show <goalId>` | JSON mặc định, không cần cờ |
+| `package list <goalId>` | JSON mặc định, không cần cờ — nguồn trạng thái theo từng package (GOAL-004) |
 
 Reader không đọc trực tiếp file journal hay SQLite trong controller home;
 CLI là giao diện duy nhất. Reader reject (throw) khi CLI fail (exit code
@@ -249,6 +357,25 @@ thật đã ghi lại trong `src/test-fixtures/`):
 - `packageStatus`: `none` khi chưa submit lần nào; `red` khi mọi package
   đã submit đều đỏ (`redGates` bằng tổng số submit và lớn hơn 0);
   `pending` khi đã submit nhưng chưa có kết quả.
+- `packages` (GOAL-004): map từng package id trong `package list` sang
+  trạng thái của nó — APOS `pending` (đã đăng ký, chưa submit) thành
+  `none`, APOS `submitted` (đã submit, chưa có kết quả) thành `pending`,
+  `green` thành `green`, `red` thành `red`, `needs-human` thành
+  `needs-human`. `goal show` không in bảng package và `metrics show`
+  chỉ có tổng, nên `package list` là nguồn duy nhất cho trạng thái theo
+  từng package. Khi lệnh này không gọi được (executor cũ chưa biết lệnh
+  này, hoặc CLI lỗi), reader bỏ qua và để `packages` trống — các trường
+  scalar Solo vẫn đúng như trước; output trả về (exit 0) mà parse lỗi
+  thì reader reject như mọi nguồn khác.
+- `integrationStatus` luôn là `"none"` (GOAL-004 — xem mục "Multi-WP"):
+  không có lệnh đọc nào của APOS lộ kết quả integration gate
+  (`integration prepare` chỉ chứng minh mọi package green và liệt kê
+  commit green / conflict; `goal show` và `metrics show` không có kết
+  quả gate), nên reader không đoán kết quả và không sửa tay state APOS.
+  Driver chạy `integration gate` biết nó green nên chạy
+  `integration complete` ngay trong cùng bước; đây là một APOS finding
+  — cần một lệnh đọc như `integration status`, hoặc kết quả gate mới
+  nhất trong `goal show` / `metrics show`.
 - `attemptsMax` và `attemptsMaxSource`: xem mục "Tín hiệu code-ready"
   bên trên — reader quét output CLI tìm `maxAttempts` (phỏng đoán theo
   APOS #69); không có thì mặc định 3, nguồn `"default"`.
@@ -280,9 +407,10 @@ git và node — nó không đi kèm repo này; đặt `APOS_CLI` khi CLI nằm 
 ## Dry run
 
 `npm run dry-run` chạy `runDryRun()` trong `src/loop.ts` trên bốn kịch bản
-mẫu, đi bộ (walk) các trạng thái mẫu qua `nextStep` thật — chuỗi bước in
-ra là đáp án của state machine, không phải chuỗi hardcode — và dừng ở
-human gate đầu tiên của mỗi kịch bản:
+mẫu Solo và một kịch bản Multi-WP, đi bộ (walk) các trạng thái mẫu qua
+`nextStep` / `nextStepForPackage` thật — chuỗi bước in ra là đáp án của
+state machine, không phải chuỗi hardcode — và dừng ở human gate đầu tiên
+của mỗi kịch bản:
 
 - `with-setup`: lead-propose -> lead-commit -> tests-submit ->
   package-submit -> wait-human-close
@@ -295,6 +423,10 @@ human gate đầu tiên của mỗi kịch bản:
   thái code-ready thật (handover đã kiểm chứng) thay vì chèn `pending`
   từ hư không như kịch bản cũ; đây là chuỗi đã kẹt ở vòng lặp live
   trước GOAL-002.
+- `multi-wp` (GOAL-004): WP-A code-ready + WP-B red ->
+  package-submit (WP-A) -> worker-fix (WP-B) -> integration-gate ->
+  integration-complete -> wait-human-close — đi bộ qua
+  `nextStepForPackage`, các bước mang `packageId` của đúng package.
 
 Dry run không tạo commit, không gọi lệnh human-gated nào, không sửa file
 thật. `humanGatedAttempted` là `false` ở mọi kịch bản; nếu chuỗi bước sai
@@ -312,5 +444,7 @@ khác 0.
 - `npm run test:live` — `node dist/live-test.js`: tự dựng project mẫu
   trong thư mục tạm và lái hai Goal thật từ selected tới green chỉ bằng
   runner ở chế độ drive — kịch bản `green-first` (green ngay lần nộp
-  đầu) và `red-then-green` (đỏ một lần rồi green sau fix) — xem ghi chú
+  đầu) và `red-then-green` (đỏ một lần rồi green sau fix) — rồi lái thêm
+  hai Goal mẫu Multi-WP 2 package (`multi-wp-green-first`,
+  `multi-wp-red-then-green`, xem mục "Multi-WP") — xem ghi chú
   provisioning pty trong `src/live-test.ts`.
