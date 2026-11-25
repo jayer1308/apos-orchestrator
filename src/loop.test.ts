@@ -55,8 +55,11 @@ describe("AC-5: dry run on a sample project gives the Solo step sequence", () =>
     // that criterion, so the criterion wins and this list is updated
     // (see _core/execute.md §1: a test contradicting an approved
     // acceptance criterion is updated and the reason cited).
+    // GOAL-004 AC-2 (approved criterion) adds the "multi-wp" scenario
+    // the same way; the list below is updated again for the same reason.
     expect(result.scenarios.map((s) => s.name).sort()).toEqual([
       "code-ready",
+      "multi-wp",
       "red-gate",
       "with-setup",
       "without-setup",

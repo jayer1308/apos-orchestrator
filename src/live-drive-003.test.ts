@@ -173,6 +173,12 @@ const READ_CALLS: ReadonlyArray<readonly string[]> = [
   ["goal", "list"],
   ["goal", "show", GOAL_ID],
   ["metrics", "show", GOAL_ID],
+  // GOAL-004 AC-1 (approved criterion) adds the sixth read-only call,
+  // `package list <goalId>`, for the per-package states; the old exact
+  // list of five calls contradicted that criterion, so the criterion
+  // wins and this list is updated (see _core/execute.md §1, and the
+  // same update in src/loop.test.ts for GOAL-002).
+  ["package", "list", GOAL_ID],
 ];
 
 /** Every CLI call the runner made must be one of the five read calls. */

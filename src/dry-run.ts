@@ -1,7 +1,7 @@
 // CLI entry for the dry run (`npm run dry-run`): prints the Solo step
-// sequence from `runDryRun()` and exits 0 when the sequence is the
-// expected one and no human-gated command was attempted. Exits non-zero
-// (throws) otherwise.
+// sequence from `runDryRun()` plus the Multi-WP scenario (GOAL-004) and
+// exits 0 when the sequences are the expected ones and no human-gated
+// command was attempted. Exits non-zero (throws) otherwise.
 //
 // `main()` itself never calls `process.exit`, so tests can call it
 // directly; only the CLI guard at the bottom of this file sets the exit
@@ -35,6 +35,13 @@ const EXPECTED_SEQUENCES: Record<DryRunScenarioName, readonly string[]> = {
     "lead-commit",
     "worker-write-code",
     "package-submit",
+    "wait-human-close",
+  ],
+  "multi-wp": [
+    "package-submit",
+    "worker-fix",
+    "integration-gate",
+    "integration-complete",
     "wait-human-close",
   ],
 };

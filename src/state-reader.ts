@@ -8,6 +8,9 @@
 // - `goal list` (text — no `--json` flag exists)
 // - `goal show <goalId>` (text — no `--json` flag exists)
 // - `metrics show <goalId>` (JSON by default — no `--json` flag exists)
+// - `package list <goalId>` (JSON by default — the per-package source,
+//   GOAL-004: `goal show` prints no package table and `metrics show`
+//   only has totals, so the per-package statuses come from here)
 //
 // Mapping (pinned by the reader tests):
 // - `status` comes from `goal show` (cross-checked against `goal list`).
@@ -20,6 +23,23 @@
 // - `packageStatus` is "none" with no submits, "red" when every submitted
 //   package hit a red gate (`redGates` equals the submit total and is > 0),
 //   and "pending" otherwise (submitted, no outcome recorded yet).
+// - `packages` maps each entry of `package list` to a `PackageState`:
+//   APOS "pending" (registered, never submitted) -> "none", APOS
+//   "submitted" (submitted, no outcome yet) -> "pending", "green" ->
+//   "green", "red" -> "red", "needs-human" -> "needs-human".
+// - `integrationStatus` is always "none" from the reader. DECISION
+//   (GOAL-004, Tester finding b): no APOS CLI read exposes the
+//   integration gate outcome — `integration prepare` only proves every
+//   package is green and lists the green commits / conflicts, and
+//   neither `goal show` nor `metrics show` carries a gate result — so
+//   the reader cannot know the gate went green, and it never edits
+//   APOS state by hand to record it. The driver that ran
+//   `integration gate` knows it went green and runs
+//   `integration complete` in the same drive step; the machine's
+//   `gate-green` -> `integration-complete` transition is exercised by
+//   its unit tests and by that driver, not by the reader. (APOS
+//   finding: a read such as `integration status`, or the latest gate
+//   in `goal show` / `metrics show`, would let the reader report it.)
 // - `attemptsMax`: best-effort scan of the CLI outputs already read
 //   (`inbox --json`, `plan --json`, `goal show`, `metrics show`) for an
 //   exposed appetite under the key `maxAttempts` (GOAL-002, APOS #69).
@@ -33,7 +53,7 @@
 //   value returned is always at least `attemptsUsed`.
 
 import { execFile } from "node:child_process";
-import type { GoalState, GoalStatus, PackageStatus } from "./state-machine.js";
+import type { GoalState, GoalStatus, PackageState, PackageStatus } from "./state-machine.js";
 import { resolveAposCli } from "./apos-cli.js";
 
 /** One APOS CLI invocation: its stdout, stderr and exit code. */
@@ -278,11 +298,80 @@ function parseMetrics(stdout: string, goalId: string): Metrics {
   return { attemptsUsed, packageStatus, maxAttempts: validMaxAttempts(parsed["maxAttempts"]) };
 }
 
+/** APOS package statuses (`src/domain/transitions.ts`) and their orchestrator mapping. */
+const PACKAGE_STATUS_MAP: Record<string, PackageStatus> = {
+  pending: "none",
+  submitted: "pending",
+  green: "green",
+  red: "red",
+  "needs-human": "needs-human",
+};
+
+/**
+ * Parse `package list <goalId>` (JSON keyed by package id): each entry's
+ * APOS status maps to a `PackageState` (see `PACKAGE_STATUS_MAP`). The
+ * entry's `attempts` count is validated when present but is not kept —
+ * the submit total already comes from `metrics show`. Rejects on
+ * unparseable JSON, a wrong shape, or an unknown APOS status, like
+ * every other source.
+ */
+function parsePackageList(stdout: string, goalId: string): Record<string, PackageState> {
+  const parsed = parseJson("package list", stdout);
+  if (!isRecord(parsed)) {
+    throw new Error("package list: unexpected JSON shape (expected an object keyed by package id)");
+  }
+  const packages: Record<string, PackageState> = {};
+  for (const [id, entry] of Object.entries(parsed)) {
+    if (!isRecord(entry) || typeof entry["status"] !== "string") {
+      throw new Error(`package list: unexpected entry for ${id} in ${goalId}`);
+    }
+    const mapped = PACKAGE_STATUS_MAP[entry["status"]];
+    if (mapped === undefined) {
+      throw new Error(`package list: unknown status "${entry["status"]}" for ${id} in ${goalId}`);
+    }
+    const attempts = entry["attempts"];
+    if (
+      attempts !== undefined &&
+      (typeof attempts !== "number" || !Number.isInteger(attempts) || attempts < 0)
+    ) {
+      throw new Error(`package list: unexpected attempts for ${id} in ${goalId}`);
+    }
+    packages[id] = { status: mapped };
+  }
+  return packages;
+}
+
+/**
+ * Read the per-package states from `package list <goalId>`. Returns
+ * `undefined` when the call itself is unavailable (the executor throws
+ * or the CLI exits non-zero — e.g. an older recorded-output executor
+ * that predates this sixth call, or a Goal with no packages yet): the
+ * caller then falls back to the scalar Solo fields. A call that
+ * answers (exit 0) but with unparseable output still rejects, like
+ * every other source.
+ */
+async function readPackageList(
+  run: CliExecutor,
+  goalId: string,
+): Promise<Record<string, PackageState> | undefined> {
+  let result: CliResult;
+  try {
+    result = await run(["package", "list", goalId]);
+  } catch {
+    return undefined;
+  }
+  if (result.exitCode !== 0) {
+    return undefined;
+  }
+  return parsePackageList(result.stdout, goalId);
+}
+
 /**
  * Read the state of `goalId` in the project at `projectPath` via the APOS
  * CLI. Sources: `inbox --json` (primary), `plan --json`, `goal list`
  * (text — no `--json` flag exists), `goal show` (text — no `--json` flag
- * exists) and `metrics show` (JSON by default — no `--json` flag exists).
+ * exists), `metrics show` (JSON by default — no `--json` flag exists)
+ * and `package list` (JSON by default — the per-package source, GOAL-004).
  * Rejects when the CLI fails, its output cannot be parsed, or the goal is
  * not found. Never runs a human-gated command.
  *
@@ -291,6 +380,8 @@ function parseMetrics(stdout: string, goalId: string): Metrics {
  * `attemptsUsed`. `attemptsMaxSource` says where the value came from:
  * "cli" when a CLI output exposed a valid `maxAttempts` (APOS #69), else
  * "default" — including when `options.attemptsMax` overrode it.
+ * `integrationStatus` is always "none" (see the header note: no CLI read
+ * exposes the integration gate outcome).
  */
 export async function readGoalState(
   projectPath: string,
@@ -326,6 +417,11 @@ export async function readGoalState(
   const metricsOut = await runRead(run, "metrics show", ["metrics", "show", goalId]);
   const metrics = parseMetrics(metricsOut, goalId);
 
+  // Per-package states (GOAL-004): the sixth read-only call. When the
+  // call itself is unavailable the reader falls back to the scalar
+  // Solo fields and leaves `packages` undefined (see readPackageList).
+  const packages = await readPackageList(run, goalId);
+
   // Status comes from `goal show` (its row was already checked against
   // `goal list` by the parsers above, which reject a missing goal).
   const status = goalShow.status;
@@ -352,5 +448,11 @@ export async function readGoalState(
     attemptsMax,
     attemptsMaxSource,
     packageStatus: metrics.packageStatus,
+    // Only present when `package list` answered; absent (not explicit
+    // `undefined` — exactOptionalPropertyTypes) when it did not.
+    ...(packages !== undefined ? { packages } : {}),
+    // No CLI read exposes the integration gate outcome (see the header
+    // note); the reader reports "none" and never guesses it.
+    integrationStatus: "none",
   };
 }

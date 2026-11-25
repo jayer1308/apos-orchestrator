@@ -309,20 +309,107 @@ export function nextStep(state: GoalState): Step {
 }
 
 /**
- * STUB (GOAL-004, WP-CORE — Tester step; the Worker implements it):
- * the next step for one package of a Multi-WP Goal. It applies the
- * `nextStep` rules scoped to `packageId` (that package's pending /
- * red / green / none status, its code-ready handover, its red +
- * new-handover path), and answers the goal-level integration steps:
- * when every package is green it returns `integration-gate`, and once
- * the integration gate went green (`integrationStatus: "gate-green"`)
- * it returns `integration-complete`. A Goal with no `packages` map
- * (Solo) answers exactly like `nextStep` for the same state.
+ * The next step for one package of a Multi-WP Goal (GOAL-004, WP-CORE).
+ *
+ * Rules, in order:
+ * 1. Solo (no `packages` map, or a single package in it) answers exactly
+ *    like `nextStep` for the same state — the returned step is the
+ *    `nextStep` step itself, with no `packageId` attached.
+ * 2. A non-executing Goal status wins over the packages (verified stays
+ *    `wait-human-close`, draft stays `wait-human-approve`, ...), again
+ *    exactly like `nextStep`.
+ * 3. When every package is green it returns `integration-gate`
+ *    (humanGate false — the driver runs `apos integration gate
+ *    <goalId> --commit <sha> --reason <text>`); once the integration
+ *    gate went green (`integrationStatus: "gate-green"`) it returns
+ *    `integration-complete`. With one package green and one not, there
+ *    is no integration step: the next step still belongs to the
+ *    unfinished package.
+ * 4. Otherwise it applies the `nextStep` rules scoped to `packageId`:
+ *    that package's pending / red / green / none status, its own
+ *    code-ready handover, its own red + new-handover path. A handover
+ *    is trusted only when it is in NO package's submitted or red lists
+ *    (the union across packages — a commit that went red for any
+ *    package is never submitted for another). A green package while
+ *    others are unfinished has no step of its own, so the machine
+ *    answers with the first unfinished package's step (with that
+ *    package's id), instead of `wait-human-close` or an integration
+ *    step. Per-package steps carry `packageId`; integration steps do
+ *    not (they belong to the whole Goal).
  */
 export function nextStepForPackage(state: GoalState, packageId: string): Step {
-  void state;
-  void packageId;
-  throw new Error("not implemented");
+  const packages = state.packages;
+  const packageIds = packages === undefined ? [] : Object.keys(packages);
+  if (packageIds.length <= 1 || state.status !== "executing") {
+    return nextStep(state);
+  }
+
+  const getPackage = (id: string): PackageState =>
+    packages?.[id] ?? { status: "none" };
+
+  // Every package green: the integration gate runs before the Goal can
+  // be closed. `gate-pending` (gate outcome unknown) still needs the
+  // gate, so only `gate-green` advances to integration-complete.
+  if (packageIds.every((id) => getPackage(id).status === "green")) {
+    if (state.integrationStatus === "gate-green") {
+      return {
+        action: "integration-complete",
+        reason:
+          "Every package is green and the integration gate went green; the driver runs `apos integration complete` with the integration commit to verify the Goal.",
+        humanGate: false,
+      };
+    }
+    return {
+      action: "integration-gate",
+      reason:
+        "Every package is green; the driver builds one integration commit from the green package commits and runs `apos integration gate` on it.",
+      humanGate: false,
+    };
+  }
+
+  const pkg = getPackage(packageId);
+  if (pkg.status === "green") {
+    // A green package has no step of its own while another package is
+    // unfinished: answer with the unfinished package's step so the
+    // driver keeps driving the Goal (never an integration step and
+    // never wait-human-close here).
+    const unfinished = packageIds.find((id) => getPackage(id).status !== "green");
+    if (unfinished !== undefined) {
+      return nextStepForPackage(state, unfinished);
+    }
+    // Unreachable: the all-green case above already returned.
+    return nextStep(state);
+  }
+
+  // Scope the Solo rules to this package: its status, its code-ready
+  // handover, and the union of every package's submitted / red commits
+  // (plus the scalar lists) so a red commit is never re-submitted for
+  // any package. Submitted and red are unioned separately: a commit is
+  // blocked from re-submit when it is in EITHER union, and the
+  // machine's reasons distinguish the two, so keep the two lists apart.
+  const submittedUnion = [...new Set([
+    ...(state.submittedCommits ?? []),
+    ...packageIds.flatMap((id) => getPackage(id).submittedCommits ?? []),
+  ])];
+  const redUnion = [...new Set([
+    ...(state.redCommits ?? []),
+    ...packageIds.flatMap((id) => getPackage(id).redCommits ?? []),
+  ])];
+  // Drop the packages map for the projection: `nextStep` answers from
+  // the scalar fields only, and the type forbids an explicit
+  // `packages: undefined` (exactOptionalPropertyTypes).
+  const { packages: _dropped, ...projectedBase } = state;
+  void _dropped;
+  const projected: GoalState = {
+    ...projectedBase,
+    packageStatus: pkg.status,
+    codeReady: pkg.codeReady ?? false,
+    handoverCommit: pkg.handoverCommit ?? null,
+    submittedCommits: submittedUnion,
+    redCommits: redUnion,
+  };
+  const step = nextStep(projected);
+  return { ...step, packageId };
 }
 
 /**
