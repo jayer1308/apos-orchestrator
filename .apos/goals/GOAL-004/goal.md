@@ -1,16 +1,16 @@
-# GOAL-004 v1: Hỗ trợ Multi-WP: loop theo dõi trạng thái theo từng package, integration gate khi mọi package green, runner drive xử lý handover theo từng package — chứng minh bằng live-test lái Goal thật có 2 package song song chỉ bằng runner.
+# GOAL-004 v2: Hỗ trợ Multi-WP: loop theo dõi trạng thái theo từng package, integration gate khi mọi package green, runner drive xử lý handover theo từng package — chứng minh bằng live-test lái Goal thật có 2 package song song chỉ bằng runner.
 
 Status: approved
 
 ```json
 {
   "id": "GOAL-004",
-  "version": 1,
+  "version": 2,
   "outcome": "Hỗ trợ Multi-WP: loop theo dõi trạng thái theo từng package, integration gate khi mọi package green, runner drive xử lý handover theo từng package — chứng minh bằng live-test lái Goal thật có 2 package song song chỉ bằng runner.",
   "source": {
     "path": "brief-004.md",
     "sha256": "d32f0548992dcf6fee91e21f80543b9d384650025ba4509cea2fd8d0b5002cd1",
-    "capturedAt": "2026-11-25T05:55:51.041Z",
+    "capturedAt": "2026-11-25T06:03:08.983Z",
     "origin": "human"
   },
   "requirements": [
