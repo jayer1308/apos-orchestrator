@@ -170,7 +170,15 @@ describe("AC-1 (GOAL-002): a handover is never submitted twice or after going re
     expect(stepHandover(step)).not.toBe(RED_COMMIT);
   });
 
-  it("AC-1: red package with a NEW handover still goes to worker-fix (fix first, submit the new commit after)", () => {
+  it("AC-3 (GOAL-003): red package with a NEW verified handover now goes to package-submit with it, not worker-fix", () => {
+    // GOAL-003 AC-3 supersedes the GOAL-002 convention pinned here
+    // before ("red + NEW handover -> worker-fix, fix first, submit the
+    // new commit after"): the machine now returns package-submit when
+    // the red gate has attempts left and a new handover is already
+    // verified, so the loop no longer asks the machine again and gets
+    // worker-fix for the same red gate. The old expectation contradicted
+    // the approved GOAL-003 criterion, so the criterion wins and this
+    // test is updated (same precedent as loop.test.ts for GOAL-002).
     const step = nextStep(
       state({
         status: "executing",
@@ -182,7 +190,8 @@ describe("AC-1 (GOAL-002): a handover is never submitted twice or after going re
         redCommits: [RED_COMMIT],
       }),
     );
-    expect(step.action).toBe("worker-fix");
+    expect(step.action).toBe("package-submit");
+    expect(stepHandover(step)).toBe(OTHER_HANDOVER);
     expect(stepHandover(step)).not.toBe(RED_COMMIT);
   });
 
